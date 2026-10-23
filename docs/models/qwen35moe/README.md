@@ -220,13 +220,13 @@ Three mechanisms, each measured on its own:
 Measured on the artifact (`gufo bench`, gfx1151, RelWithDebInfo with assertions,
 same run repeated twice):
 
-| test | per-token routing | bucketed | + 16-row sharing | + batched shared expert | llama.cpp (same GPU) |
-| --- | --- | --- | --- | --- | --- |
-| pp128 | 44.1 | 131.3 | 135.9 | - | 157.4 | **217.3** |
-| pp512 | 44.4 | 160.9 | 170.5 | 195.5 | 206.6 | **369.1** | 530.9 |
-| pp2048 | 43.4 | 162.6 | 175.4 | 198.9 | 212.0 | **584.5** | - |
-| pp4096 | - | - | - | - | - | **612.8** | - |
-| tg8 | 19.5 | 19.6 | 19.6 | 19.6 | 19.6 | 19.6 | - |
+| test | per-token routing | bucketed | + 16-row sharing | + batched shared expert | + matrix core | + expert-parallel | llama.cpp |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| pp128 | 44.1 | 131.3 | 135.9 | 157.4 | 217.3 | **321.4** | 157.4 |
+| pp512 | 44.4 | 160.9 | 170.5 | 195.5 | 369.1 | **530.6** | 530.9 |
+| pp2048 | 43.4 | 162.6 | 175.4 | 198.9 | 584.5 | **735.0** | - |
+| pp4096 | - | - | - | - | 612.8 | **713.8** | - |
+| tg8 | 19.5 | 19.6 | 19.6 | 19.6 | 19.6 | 19.6 | 21.6 |
 
 The shared-expert step alone is worth 15% of prefill: skipping it entirely
 measured pp512 224.7 and pp2048 230.4, so about half of what it still costs is
@@ -257,12 +257,14 @@ per row plus one sigmoid-scale kernel per row was 2048 launches per layer at
 pp2048 width; `LaunchMoeRouteRows` and `LaunchSigmoidScaledAddRows` make it one
 each, worth 28% of pp512 and 35% of pp2048 on its own.
 
-**Where the remaining time is.** Two ablations, each with the model still
-running so the shapes are unchanged: skipping the routed experts measures pp512
-1455 tok/s and pp2048 892 tok/s, and skipping the twelve full-attention layers
-measures pp512 362 and pp2048 608. So at pp512 the experts are 75% of the chunk
-and attention is 2%; at pp2048 the experts are 44% and attention is 25%, the
-rest being the DeltaNet recurrence and the dense projections.
+**Where the remaining time is.** Ablations with the model still running, so
+every shape is unchanged. Skipping the routed expert GEMMs measures pp512 1455
+tok/s and pp2048 892; skipping the whole mixture-of-experts FFN measures pp2048
+1921, which puts 70% of the chunk inside that FFN (routed GEMMs, shared expert
+and the gather/quantize/scatter plumbing). On the non-expert side, skipping the
+attention measures pp2048 623.6 and skipping the DeltaNet recurrence 602.6
+against 584.8, so after the tiled attention fix those two are 6% and 3%: nearly
+all of the remaining non-expert time is the dense projections and the norms.
 
 **The tiled attention kernel now covers this model's head layout.** The twelve
 full-attention layers were running `prefill_baseline` above a 1024-token
@@ -281,21 +283,59 @@ Measure each width in its own run: the first prompt of a combined sweep reads
 about 3x low here (60.96 against 217.4 for pp128), and it repeats as a clean
 217.3-217.6 three times on its own.
 
-That split explains the pp curve. It also says the expert path is no longer the
-place to look for a large win at short prompts: `moe_expert_gemm_bench` measures
-the three projections of a sixteen-token bucket at 65 GB/s per byte read (gate
-and up at 57, down at 69), against about 68 GB/s for llama.cpp. One thing is still on the
-table: every expert is its own kernel launch, so a bucket of 32 blocks pays a
-tail on a 20-WGP part 256 times per layer, and a grid over all buckets of a
-layer would remove it.
+**Experts run four at a time.** A bucket GEMM is one launch of about 32 blocks,
+and the part has 40 compute units, so a single stream leaves most of the part
+idle no matter how many experts a layer has: 256 launches in a row still only
+ever have one bucket's blocks resident. `moe_expert_gemm_bench` measures the
+production pattern (256 buckets of the reported width, the same work spread over
+1, 2, 4 and 8 streams):
+
+| Q4_K gate/up | 16 rows | 32 | 64 | 128 |
+| --- | --- | --- | --- | --- |
+| one stream | 48.9 | 48.6 | 46.6 | 30.5 GB/s |
+| four streams | 84.4 | 83.7 | 83.2 | 51.5 GB/s |
+| eight streams | 84.7 | 83.8 | 83.2 | 51.5 GB/s |
+
+Four streams is the knee; eight adds nothing. Benchmarking one bucket at a time
+had hidden this, because the launch tail looked like the whole cost. Expert `e`
+now runs its gather, quantize, gate/up, SwiGLU and down on stream `e % 4`
+against slice `e % 4` of every per-expert scratch buffer, so no two experts that
+run at the same time share memory, and consecutive experts that share a stream
+also share a slice and therefore serialize. The scatters stay on the main stream
+after a fence, in expert order, which keeps the accumulation order and the
+result bit-identical to the unsplit path
+(`qwen_moe_real_weights_test` asserts `max|diff| = 0` at 5, 32 and 1024 rows).
+
+The expert output needed its own slot per packed row for this: with a shared
+buffer, a later expert on the same stream overwrote the output of an earlier one
+before the deferred scatter read it. The slots are the same packed layout the
+gather already uses, so this costs no extra traffic.
+
+**The shared expert moved in front of the experts, for a correctness reason.**
+It reused slice zero and the expert-output buffer after the join, so its Q8_1
+route was reading scratch that the expert pass had rewritten. The symptom was
+exact for five rows, a 4% difference on one row of a 32-row chunk, and a few
+unrelated rows at 1024. Running it first -- before any expert touches a slice,
+writing its own result through `gathered` -- removes the aliasing and makes both
+schedules bit-identical. It costs about 3% of pp2048 compared with the aliased
+order, which is the price of the result no longer depending on what was left in
+scratch; overlapping it with the expert phase on its own slice is the next
+lever there.
+
+That split explains the pp curve, and the expert path is no longer the place to
+look for a large win at short prompts: `moe_expert_gemm_bench` measures the
+three projections of a sixteen-token bucket at 65 GB/s per byte read (gate and
+up at 57, down at 69), against about 68 GB/s for llama.cpp. What is left is
+concurrency at long context (83 GB/s against Flash-Next's reported 130) and the
+plumbing around the expert GEMMs.
 
 `kernel_resources_test` guards the new instantiations: the same sweep briefly
 moved the dense path's 128-token tile to 64 and that instantiation spilled 348
 bytes of scratch, which the check caught.
 
-Prefill is 3.6-4.9x faster than the per-token routing and now scales with the
-prompt length, because a longer chunk gives every expert more rows per weight
-stream. Generation is untouched, as it must be.
+Prefill is 7.3x (pp128) to 16.9x (pp2048) faster than the per-token routing and
+scales with the prompt length, because a longer chunk gives every expert more
+rows per weight stream. Generation is untouched, as it must be.
 
 ### What is left in prompt processing
 
