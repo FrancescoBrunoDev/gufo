@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/moe.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -213,8 +214,12 @@ int main(int argc, char** argv) {
     cpu_norm += cpu_out[i] * cpu_out[i];
   }
   // The bucketed prefill must agree with the per-row path on identical input.
-  {
-    constexpr std::size_t kRows = 5;
+  // Wide chunks take the tiled Q8_1 shared-expert route, which quantizes
+  // activations, so that width is held to a looser bound than the exact small
+  // one.
+  for (const auto [kRows, min_cosine] :
+       {std::pair<std::size_t, float>{5, 0.999F},
+        std::pair<std::size_t, float>{32, 0.9995F}}) {
     using gufo::models::qwen::kMaxSelectedExperts;
     std::vector<float> rows_x(kRows * hidden);
     for (std::size_t r = 0; r < kRows; ++r) {
@@ -243,6 +248,13 @@ int main(int argc, char** argv) {
     gufo::test::DeviceBuffer<std::uint32_t> dperm_slots(kRows *
                                                         kMaxSelectedExperts);
     gufo::test::DeviceBuffer<std::uint32_t> doffsets(experts + 1);
+    const std::size_t shared_ffn =
+        config.shared_expert_feed_forward_length != 0
+            ? config.shared_expert_feed_forward_length
+            : expert_ffn;
+    const std::size_t q8_bytes = gufo::hip::QuantizedActivationBytes(
+        std::max<std::size_t>(kRows, 16), std::max(hidden, shared_ffn));
+    gufo::test::DeviceBuffer<std::byte> dq8(q8_bytes);
 
     gufo::models::qwen::MoeFfnForwardRowsBucketed(
         gufo::models::qwen::HipModuleContext{}, device_layer, config, kRows,
@@ -260,7 +272,8 @@ int main(int argc, char** argv) {
                                  kRows * kMaxSelectedExperts),
         std::span<std::uint32_t>(dperm_slots.data(),
                                  kRows * kMaxSelectedExperts),
-        std::span<std::uint32_t>(doffsets.data(), experts + 1));
+        std::span<std::uint32_t>(doffsets.data(), experts + 1),
+        std::span<std::byte>(dq8.data(), dq8.size()));
     gufo::models::qwen::MoeFfnForwardRows(
         gufo::models::qwen::HipModuleContext{}, device_layer, config, kRows,
         std::span<const float>(dx.data(), kRows * hidden),
@@ -290,7 +303,7 @@ int main(int argc, char** argv) {
         dot / std::sqrt(std::max(rows_norm * bucket_norm, 1e-30F));
     std::cout << "bucketed vs per-row: rows=" << kRows
               << " max|diff|=" << bucket_max << " cosine=" << cosine << "\n";
-    if (cosine < 0.999F) {
+    if (cosine < min_cosine) {
       std::cout << "bucketed prefill disagrees with the per-row path\n";
       return 1;
     }

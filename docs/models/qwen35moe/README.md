@@ -203,11 +203,19 @@ Three mechanisms, each measured on its own:
    passes, so it keeps the eight-row split; this artifact's experts are all
    Q4_K/Q5_K, so nothing is lost.
 3. **Batched shared expert.** The shared expert is a dense FFN, and it was still
-   run one row at a time, which re-read its three matrices for every token. It
-   now uses the same batched entry point for the whole chunk and keeps only the
-   scalar `sigmoid(gate)` per row, because that weight is fp32 and the batched
-   entry point returns early for fp32. The result is bit-identical to the per-row
-   path: layers 0-3 and the logits match the pre-change dump exactly.
+   run one row at a time, which re-read its three Q8_0 matrices for every token.
+   From sixteen rows up it now takes the tiled Q8_1 prefill route the dense FFN
+   already uses (`LaunchQuantizeActivationQ8_1FromFp32`, then the fused
+   gate/up pair, the SwiGLU-quantize epilogue and the down projection), so each
+   matrix is streamed once for the whole chunk. Narrower chunks keep the FP32
+   batched path, which stays bit-identical to the per-row path. Only the scalar
+   `sigmoid(gate)` remains per row: that weight is fp32, and the batched entry
+   points return early for fp32.
+   The small-row path is exact: `bucketed vs per-row rows=5 cosine=1`. The wide
+   path quantizes the activations, so it is measured against the exact path at
+   `rows=32 cosine=0.999921`, held to 0.9995 by
+   `qwen_moe_real_weights_test`; this is the same numerics class the dense FFN
+   prefill and llama.cpp use.
 
 Measured on the artifact (`gufo bench`, gfx1151, RelWithDebInfo with assertions,
 same run repeated twice):
@@ -215,9 +223,13 @@ same run repeated twice):
 | test | per-token routing | bucketed | + 16-row sharing | + batched shared expert | llama.cpp (same GPU) |
 | --- | --- | --- | --- | --- | --- |
 | pp128 | 44.1 | 131.3 | 135.9 | - | - |
-| pp512 | 44.4 | 160.9 | 170.5 | **195.5** | 530.9 |
-| pp2048 | 43.4 | 162.6 | 175.4 | **198.9** | - |
+| pp512 | 44.4 | 160.9 | 170.5 | **206.6** | 530.9 |
+| pp2048 | 43.4 | 162.6 | 175.4 | **212.0** | - |
 | tg8 | 19.5 | 19.6 | 19.6 | 19.6 | - |
+
+The shared-expert step alone is worth 15% of prefill: skipping it entirely
+measured pp512 224.7 and pp2048 230.4, so about half of what it still costs is
+the per-row scalar gate and the Q8_1 quantize passes.
 
 Prefill is 4.4-4.6x faster than the per-token routing and now scales with the
 prompt length. Generation is untouched, as it must be.

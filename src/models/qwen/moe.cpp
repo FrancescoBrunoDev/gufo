@@ -311,7 +311,8 @@ void MoeFfnForwardRowsBucketed(
     std::span<float> expert_out, std::span<float> out,
     std::span<float> gathered, std::span<std::uint32_t> perm_rows,
     std::span<std::uint32_t> perm_slots,
-    std::span<std::uint32_t> expert_offsets) noexcept {
+    std::span<std::uint32_t> expert_offsets,
+    std::span<std::byte> q8_activation) noexcept {
   const std::size_t hidden = config.hidden_size;
   const std::size_t experts = config.expert_count;
   const std::size_t selected_per_row = config.expert_used_count;
@@ -453,26 +454,53 @@ void MoeFfnForwardRowsBucketed(
   }
 
   if (!layer.ffn_gate_shexp.empty()) {
-    // The shared expert is a dense FFN, so its weights are streamed once for
-    // the whole chunk instead of once per token. Only the scalar gate stays per
-    // row: it is one vector, and the batched entry point ignores fp32 weights.
+    // The shared expert is a dense FFN over every row. From sixteen rows up its
+    // projections use the tiled Q8_1 prefill GEMMs the dense FFN uses, so each
+    // matrix is streamed once instead of once per eight rows; below that the
+    // FP32 batched path is cheaper and keeps the exact activation contract the
+    // operator tests compare against.
     const std::size_t shared_ffn =
         config.shared_expert_feed_forward_length != 0
             ? config.shared_expert_feed_forward_length
             : expert_ffn;
-    ::gufo::hip::LaunchBatchedQuantGEMMFp32(
-        layer.ffn_gate_shexp.type, layer.ffn_gate_shexp.data, x.data(),
-        gate_scratch.data(), rows, shared_ffn, hidden, stream);
-    ::gufo::hip::LaunchBatchedQuantGEMMFp32(
-        layer.ffn_up_shexp.type, layer.ffn_up_shexp.data, x.data(),
-        up_scratch.data(), rows, shared_ffn, hidden, stream);
-    ::gufo::hip::LaunchBatchedSwiGLUActivation(
-        gate_scratch.data(), up_scratch.data(), act_scratch.data(), nullptr,
-        rows * shared_ffn, stream);
-    ::gufo::hip::LaunchBatchedQuantGEMMFp32(
-        layer.ffn_down_shexp.type, layer.ffn_down_shexp.data,
-        act_scratch.data(), expert_out.data(), rows, hidden, shared_ffn,
-        stream);
+    constexpr std::size_t kSharedPrefillRows = 16;
+    const bool prefill_shared =
+        rows >= kSharedPrefillRows &&
+        q8_activation.size() >=
+            ::gufo::hip::QuantizedActivationBytes(rows, hidden);
+    if (prefill_shared) {
+      void* q8_x = q8_activation.data();
+      ::gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(x.data(), q8_x, rows,
+                                                        hidden, stream);
+      ::gufo::hip::LaunchBatchedDualQuantGEMMPreQuantized(
+          layer.ffn_gate_shexp.type, layer.ffn_gate_shexp.data,
+          layer.ffn_up_shexp.data, q8_x, gate_scratch.data(), up_scratch.data(),
+          rows, shared_ffn, hidden, stream);
+      // The gate/up GEMMs have consumed the activation, so the same buffer
+      // takes the SwiGLU result's Q8_1 form for the down projection.
+      ::gufo::hip::LaunchBatchedFusedSwiGLUQuantizeQ8_1(
+          gate_scratch.data(), up_scratch.data(), q8_x, rows, shared_ffn,
+          stream);
+      ::gufo::hip::LaunchBatchedQuantGEMMPreQuantized(
+          layer.ffn_down_shexp.type, layer.ffn_down_shexp.data, q8_x,
+          expert_out.data(), rows, hidden, shared_ffn, stream);
+    } else {
+      ::gufo::hip::LaunchBatchedQuantGEMMFp32(
+          layer.ffn_gate_shexp.type, layer.ffn_gate_shexp.data, x.data(),
+          gate_scratch.data(), rows, shared_ffn, hidden, stream);
+      ::gufo::hip::LaunchBatchedQuantGEMMFp32(
+          layer.ffn_up_shexp.type, layer.ffn_up_shexp.data, x.data(),
+          up_scratch.data(), rows, shared_ffn, hidden, stream);
+      ::gufo::hip::LaunchBatchedSwiGLUActivation(
+          gate_scratch.data(), up_scratch.data(), act_scratch.data(), nullptr,
+          rows * shared_ffn, stream);
+      ::gufo::hip::LaunchBatchedQuantGEMMFp32(
+          layer.ffn_down_shexp.type, layer.ffn_down_shexp.data,
+          act_scratch.data(), expert_out.data(), rows, hidden, shared_ffn,
+          stream);
+    }
+    // Only the scalar gate stays per row: it is a single fp32 vector, and the
+    // batched entry points ignore fp32 weights.
     for (std::size_t row = 0; row < rows; ++row) {
       const std::span<const float> input = x.subspan(row * hidden, hidden);
       std::span<float> gate_logit = router_logits.subspan(row * experts, 1);

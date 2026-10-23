@@ -922,6 +922,11 @@ QwenGpuScratchView QwenGpuArena::GetScratchView(
                                  batch * models::qwen::kMaxSelectedExperts},
               .moe_expert_offsets = {d_moe_expert_offsets,
                                      config_.expert_count + 1},
+              .q8_activation = {static_cast<std::byte*>(d_scratch_q8_act),
+                                QuantizedActivationBytes(
+                                    (((batch + 15) / 16) * 16),
+                                    std::max<std::size_t>(
+                                        config_.intermediate_size, hidden))},
           },
   };
 }

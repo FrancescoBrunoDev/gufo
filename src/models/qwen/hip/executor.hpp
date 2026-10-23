@@ -234,6 +234,9 @@ struct QwenFfnScratch {
   std::span<std::uint32_t> moe_perm_rows;
   std::span<std::uint32_t> moe_perm_slots;
   std::span<std::uint32_t> moe_expert_offsets;
+  /// Tiled Q8_1 activation scratch, reused by the shared expert's prefill
+  /// GEMMs.
+  std::span<std::byte> q8_activation;
 };
 
 /// Typed non-owning capability views over stable Qwen GPU arena allocations.
