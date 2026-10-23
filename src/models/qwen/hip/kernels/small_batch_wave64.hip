@@ -498,6 +498,19 @@ bool TryLaunchKQuantSmallBatchWave64(core::GgmlType type, const void* w,
   const bool medium_up = k == 5120 && (m == 6144 || m == 10240 || m == 12288);
   const bool medium_down = m == 5120 && k == 6144;
   if (batch > 8) {
+    // A mixture-of-experts bucket of up to sixteen rows shares one weight
+    // stream instead of being split into two eight-row passes that each reread
+    // the whole expert. Shapes with their own qualified route keep it.
+    // IQ4_XS keeps the eight-row split: the sixteen-row geometry measured
+    // slower than two passes at these expert widths.
+    const bool expert_bucket =
+        groups == 1 && batch == 16 && !up && !down && !medium_up &&
+        !medium_down && !(m == 248320 && k == 5120) &&
+        (type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ5_K);
+    if (expert_bucket) {
+      LaunchKQuantSixteenWave64(type, w, x, y, m, k, stream, 1);
+      return true;
+    }
     // Preserve scalar accumulation while reusing each weight row across more
     // verification tokens on the native 64-lane wave.
     if (type == core::GgmlType::kQ6_K) {

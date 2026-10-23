@@ -453,10 +453,35 @@ void MoeFfnForwardRowsBucketed(
   }
 
   if (!layer.ffn_gate_shexp.empty()) {
+    // The shared expert is a dense FFN, so its weights are streamed once for
+    // the whole chunk instead of once per token. Only the scalar gate stays per
+    // row: it is one vector, and the batched entry point ignores fp32 weights.
+    const std::size_t shared_ffn =
+        config.shared_expert_feed_forward_length != 0
+            ? config.shared_expert_feed_forward_length
+            : expert_ffn;
+    ::gufo::hip::LaunchBatchedQuantGEMMFp32(
+        layer.ffn_gate_shexp.type, layer.ffn_gate_shexp.data, x.data(),
+        gate_scratch.data(), rows, shared_ffn, hidden, stream);
+    ::gufo::hip::LaunchBatchedQuantGEMMFp32(
+        layer.ffn_up_shexp.type, layer.ffn_up_shexp.data, x.data(),
+        up_scratch.data(), rows, shared_ffn, hidden, stream);
+    ::gufo::hip::LaunchBatchedSwiGLUActivation(
+        gate_scratch.data(), up_scratch.data(), act_scratch.data(), nullptr,
+        rows * shared_ffn, stream);
+    ::gufo::hip::LaunchBatchedQuantGEMMFp32(
+        layer.ffn_down_shexp.type, layer.ffn_down_shexp.data,
+        act_scratch.data(), expert_out.data(), rows, hidden, shared_ffn,
+        stream);
     for (std::size_t row = 0; row < rows; ++row) {
-      LaunchSharedExpert(layer, config, row, x, out, gate_scratch, up_scratch,
-                         act_scratch, expert_out,
-                         router_logits.subspan(row * experts, 1), stream);
+      const std::span<const float> input = x.subspan(row * hidden, hidden);
+      std::span<float> gate_logit = router_logits.subspan(row * experts, 1);
+      ::gufo::hip::LaunchGEMV(layer.ffn_gate_inp_shexp.data,
+                              layer.ffn_gate_inp_shexp.type, input.data(),
+                              gate_logit.data(), 1, hidden, stream);
+      ::gufo::hip::LaunchSigmoidScaledAdd(
+          gate_logit.data(), expert_out.data() + (row * hidden),
+          out.data() + (row * hidden), hidden, stream);
     }
   }
 }
