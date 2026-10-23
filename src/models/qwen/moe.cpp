@@ -404,7 +404,10 @@ void MoeFfnForwardRowsBucketed(
   }
   std::vector<std::uint32_t> cursor(offsets.begin(), offsets.end() - 1);
   std::vector<std::uint32_t> packed_rows(per_row);
-  std::vector<std::uint32_t> packed_slots(per_row);
+  // Reverse of the packed order, so the combine can sum one row's selections in
+  // a single block instead of scattering them atomically.
+  constexpr std::uint32_t kUnsetPackedSlot = 0xFFFFFFFFU;
+  std::vector<std::uint32_t> slot_to_packed(per_row, kUnsetPackedSlot);
   for (std::size_t row = 0; row < rows; ++row) {
     for (std::size_t slot = 0; slot < selected_per_row; ++slot) {
       const std::uint32_t expert = host_ids[(row * kMaxSelectedExperts) + slot];
@@ -413,7 +416,8 @@ void MoeFfnForwardRowsBucketed(
       }
       const std::uint32_t packed = cursor[expert]++;
       packed_rows[packed] = static_cast<std::uint32_t>(row);
-      packed_slots[packed] = static_cast<std::uint32_t>(slot);
+      slot_to_packed[(row * kMaxSelectedExperts) + slot] =
+          static_cast<std::uint32_t>(packed);
     }
   }
   // Blocking uploads: the sources are function-local, so an asynchronous copy
@@ -421,7 +425,7 @@ void MoeFfnForwardRowsBucketed(
   if (hipMemcpy(perm_rows.data(), packed_rows.data(),
                 per_row * sizeof(std::uint32_t),
                 hipMemcpyHostToDevice) != hipSuccess ||
-      hipMemcpy(perm_slots.data(), packed_slots.data(),
+      hipMemcpy(perm_slots.data(), slot_to_packed.data(),
                 per_row * sizeof(std::uint32_t),
                 hipMemcpyHostToDevice) != hipSuccess ||
       hipMemcpy(expert_offsets.data(), offsets.data(),
@@ -635,18 +639,11 @@ void MoeFfnForwardRowsBucketed(
       }
     }
   }
-  for (std::size_t expert = 0; expert < experts; ++expert) {
-    const std::uint32_t begin = offsets[expert];
-    const std::uint32_t count = counts[expert];
-    if (count == 0) {
-      continue;
-    }
-    ::gufo::hip::LaunchMoeScatterAccumulate(
-        expert_out.data() + (static_cast<std::size_t>(begin) * hidden),
-        perm_rows.data() + begin, perm_slots.data() + begin,
-        expert_weights.data(), out.data(), count, hidden,
-        static_cast<std::uint32_t>(kMaxSelectedExperts), stream);
-  }
+  ::gufo::hip::LaunchMoeCombineSlots(
+      expert_out.data(), perm_slots.data(), expert_weights.data(), out.data(),
+      static_cast<std::uint32_t>(rows), hidden,
+      static_cast<std::uint32_t>(kMaxSelectedExperts),
+      static_cast<std::uint32_t>(selected_per_row), stream);
 }
 
 void MoeFfnForward(const HipModuleContext& ctx, const QwenLayerWeights& layer,

@@ -37,6 +37,18 @@ void LaunchMoeGatherRows(const float* x, const std::uint32_t* rows, float* dst,
                          std::uint32_t count, std::size_t hidden,
                          hipStream_t stream = nullptr);
 
+/// out[row] += sum over slots of weights[row * slot_stride + slot] *
+/// src[slot_to_packed[row * slot_stride + slot]], one block per row. A row's
+/// selections are all combined by the same block, so no atomics are needed and
+/// the sum runs in slot order. `slot_to_packed` uses 0xFFFFFFFF for a selection
+/// the bucketing skipped.
+void LaunchMoeCombineSlots(const float* src,
+                           const std::uint32_t* slot_to_packed,
+                           const float* weights, float* out, std::uint32_t rows,
+                           std::size_t hidden, std::uint32_t slot_stride,
+                           std::uint32_t used_slots,
+                           hipStream_t stream = nullptr);
+
 /// out[rows[i]] += weights[rows[i] * slot_stride + slots[i]] * src[i] for every
 /// packed row `i`. Entries of one token can reach this kernel from different
 /// blocks, so the accumulation is atomic per element.

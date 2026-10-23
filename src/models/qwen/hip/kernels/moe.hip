@@ -9,6 +9,8 @@ namespace gufo::hip {
 namespace {
 
 constexpr std::uint32_t kRoutingLanes = 32;
+/// Marks a (row, slot) the bucketing skipped, so the combine leaves it out.
+constexpr std::uint32_t kUnsetPackedSlot = 0xFFFFFFFFU;
 constexpr std::uint64_t kRoutingMask = 0xFFFFFFFFFFFFFFFFULL;
 
 /// One warp selects the experts. Every reduction is a warp reduction, and the
@@ -114,6 +116,39 @@ __global__ void MoeGatherRowsKernel(const float* __restrict__ x,
     const std::size_t row = i / hidden;
     const std::size_t column = i - (row * hidden);
     dst[i] = x[(static_cast<std::size_t>(rows[row]) * hidden) + column];
+  }
+}
+
+/// Sums a row's routed expert results, one block per row. `slot_to_packed` maps
+/// (row, slot) to the position the bucketing gave that selection, so a block
+/// owns its whole output row: no atomics, and the accumulation happens in slot
+/// order, which keeps the result independent of the expert schedule.
+__global__ void MoeCombineSlotsKernel(
+    const float* __restrict__ src,
+    const std::uint32_t* __restrict__ slot_to_packed,
+    const float* __restrict__ weights, float* __restrict__ out,
+    std::uint32_t rows, std::size_t hidden, std::uint32_t slot_stride,
+    std::uint32_t used_slots) {
+  const std::uint32_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const float* row_weights =
+      weights + (static_cast<std::size_t>(row) * slot_stride);
+  const std::uint32_t* row_slots =
+      slot_to_packed + (static_cast<std::size_t>(row) * slot_stride);
+  float* dst = out + (static_cast<std::size_t>(row) * hidden);
+  for (std::size_t col = threadIdx.x; col < hidden; col += blockDim.x) {
+    float acc = 0.0F;
+    for (std::uint32_t slot = 0; slot < used_slots; ++slot) {
+      const std::uint32_t packed = row_slots[slot];
+      if (packed == kUnsetPackedSlot) {
+        continue;
+      }
+      acc += row_weights[slot] *
+             src[(static_cast<std::size_t>(packed) * hidden) + col];
+    }
+    dst[col] += acc;
   }
 }
 
@@ -279,6 +314,19 @@ void LaunchMoeGatherRows(const float* x, const std::uint32_t* rows, float* dst,
       std::min<std::size_t>((total + kThreads - 1) / kThreads, 1024));
   MoeGatherRowsKernel<<<blocks, kThreads, 0, stream>>>(x, rows, dst, count,
                                                        hidden);
+}
+
+void LaunchMoeCombineSlots(const float* src,
+                           const std::uint32_t* slot_to_packed,
+                           const float* weights, float* out, std::uint32_t rows,
+                           std::size_t hidden, std::uint32_t slot_stride,
+                           std::uint32_t used_slots, hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 256;
+  if (rows == 0 || hidden == 0 || used_slots == 0) {
+    return;
+  }
+  MoeCombineSlotsKernel<<<rows, kThreads, 0, stream>>>(
+      src, slot_to_packed, weights, out, rows, hidden, slot_stride, used_slots);
 }
 
 void LaunchMoeScatterAccumulate(const float* src, const std::uint32_t* rows,

@@ -291,7 +291,7 @@ skipped and everything else untouched, so the shapes are identical. Total is
 | --- | --- | --- |
 | nothing | 735 | - |
 | the three routed expert GEMMs | 1110 | **1.40 s** (51%) |
-| the scatter back to the tokens | 782 | 0.17 s (6%) |
+| the scatter back to the tokens | 782 | 0.17 s (6%), since replaced by one atomic-free combine |
 | the shared expert | 770 | 0.13 s (5%) |
 | the gather | 764 | 0.11 s (4%) |
 | everything outside the MoE FFN | 1921 | 0.85 s (31%) |
@@ -305,6 +305,18 @@ therefore already at the rate the kernel can hold, and the remaining lever on
 this phase is the scratch traffic, not the dequant: fusing the SwiGLU epilogue
 into the up projection (-0.26 GB/layer) and the down projection's epilogue into
 the accumulation (-0.39 GB/layer) are worth about 0.2 s and 0.3 s.
+
+**The scatter became one combine.** Every expert launched its own scatter, 256
+small kernels per layer that accumulated with an atomic per element, so a chunk
+reached 12288 launches and 2.4 G atomics. The bucketing already knows where each
+selection landed, so it also builds the reverse map from (row, slot) to packed
+position and one kernel per layer sums a row's eight selections in slot order:
+one block owns a whole output row, there is nothing to synchronise, and the
+result no longer depends on the order the experts ran in. It is still
+deterministic across the split and unsplit schedules
+(`qwen_moe_real_weights_test` asserts `max|diff| = 0` at 5, 32 and 1024 rows) and
+its order now matches the per-row path's, which moved `rows=5` from 5.96e-08 to
+2.98e-08. Worth pp128 321 -> 340, pp2048 746 -> 779, pp4096 729 -> 747.
 
 **The non-expert remainder is at the dense rate, not below it.** The old note
 here claimed it ran at a third of the dense FFN's per-FLOP rate; that was an
