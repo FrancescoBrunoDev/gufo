@@ -283,6 +283,38 @@ Measure each width in its own run: the first prompt of a combined sweep reads
 about 3x low here (60.96 against 217.4 for pp128), and it repeats as a clean
 217.3-217.6 three times on its own.
 
+**The ablation ledger at pp2048.** Each row below is one build with that phase
+skipped and everything else untouched, so the shapes are identical. Total is
+2.79 s for 2048 tokens.
+
+| phase skipped | pp2048 | phase costs |
+| --- | --- | --- |
+| nothing | 735 | - |
+| the three routed expert GEMMs | 1110 | **1.40 s** (51%) |
+| the scatter back to the tokens | 782 | 0.17 s (6%) |
+| the shared expert | 770 | 0.13 s (5%) |
+| the gather | 764 | 0.11 s (4%) |
+| everything outside the MoE FFN | 1921 | 0.85 s (31%) |
+
+The expert phase is no longer 1.40 s of weight streaming at 50 GB/s: at pp2048
+the 256 buckets read 1.45 GB of expert weights per layer, and the gather,
+the gate/up scratch, the down projection's Q8 activation and the output panel
+add 0.79 GB more. 2.24 GB per layer in 27 ms is 83 GB/s, which is exactly what
+`moe_expert_gemm_bench` measures for the four-stream pattern. The weight read is
+therefore already at the rate the kernel can hold, and the remaining lever on
+this phase is the scratch traffic, not the dequant: fusing the SwiGLU epilogue
+into the up projection (-0.26 GB/layer) and the down projection's epilogue into
+the accumulation (-0.39 GB/layer) are worth about 0.2 s and 0.3 s.
+
+**The non-expert remainder is at the dense rate, not below it.** The old note
+here claimed it ran at a third of the dense FFN's per-FLOP rate; that was an
+arithmetic error from counting 50 M parameters per layer instead of the ~150 M
+this model has (the DeltaNet q/k/v projections are 8192 wide). The 0.85 s covers
+~29 TFLOP of Q8_0 GEMM at ~35 TFLOPS, the same rate the dense 27B path reaches
+on this part, and a scout audit confirms every non-expert projection in this
+artifact is Q8_0 and already takes the tiled Q8_1 route. There is no lever
+there.
+
 **Experts run four at a time.** A bucket GEMM is one launch of about 32 blocks,
 and the part has 40 compute units, so a single stream leaves most of the part
 idle no matter how many experts a layer has: 256 launches in a row still only
@@ -319,15 +351,15 @@ unrelated rows at 1024. Running it first -- before any expert touches a slice,
 writing its own result through `gathered` -- removes the aliasing and makes both
 schedules bit-identical. It costs about 3% of pp2048 compared with the aliased
 order, which is the price of the result no longer depending on what was left in
-scratch; overlapping it with the expert phase on its own slice is the next
-lever there.
+scratch. The ablation puts the whole shared expert at 0.13 s (5%), so
+overlapping it with the expert phase on its own slice is worth at most that.
 
 That split explains the pp curve, and the expert path is no longer the place to
 look for a large win at short prompts: `moe_expert_gemm_bench` measures the
 three projections of a sixteen-token bucket at 65 GB/s per byte read (gate and
-up at 57, down at 69), against about 68 GB/s for llama.cpp. What is left is
-concurrency at long context (83 GB/s against Flash-Next's reported 130) and the
-plumbing around the expert GEMMs.
+up at 57, down at 69), against about 68 GB/s for llama.cpp. What is left is the
+scratch traffic above (0.79 GB of the 2.24 GB a layer moves) and, behind it,
+wider dequant: 83 GB/s against Flash-Next's reported 130.
 
 `kernel_resources_test` guards the new instantiations: the same sweep briefly
 moved the dense path's 128-token tile to 64 and that instantiation spilled 348
