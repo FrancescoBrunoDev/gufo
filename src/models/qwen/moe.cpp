@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "src/models/qwen/forward.hpp"  // TensorGEMV
+#include "src/models/qwen/hip/ops/gemm.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/models/qwen/hip/kernels/moe.hpp"
@@ -311,8 +312,8 @@ void MoeFfnForwardRowsBucketed(
     std::span<float> expert_out, std::span<float> out,
     std::span<float> gathered, std::span<std::uint32_t> perm_rows,
     std::span<std::uint32_t> perm_slots,
-    std::span<std::uint32_t> expert_offsets,
-    std::span<std::byte> q8_activation) noexcept {
+    std::span<std::uint32_t> expert_offsets, std::span<std::byte> q8_activation,
+    std::span<float> moe_gate, void* hipblas) noexcept {
   const std::size_t hidden = config.hidden_size;
   const std::size_t experts = config.expert_count;
   const std::size_t selected_per_row = config.expert_used_count;
@@ -320,22 +321,43 @@ void MoeFfnForwardRowsBucketed(
   // Buckets below this many rows keep the per-row GEMV chain: the batched GEMM
   // only pays off once one weight stream serves several tokens.
   constexpr std::uint32_t kBucketedRowsThreshold = 4;
+  // Above this many rows the exact FP32 kernel needs a second or third pass
+  // over the expert matrix, while the matrix-core route reads it once
+  // (measured: 43 GB/s flat against 57 GB/s at one pass and 14 GB/s at four).
+  constexpr std::uint32_t kMatrixCoreRowsThreshold = 24;
   if (rows == 0 || experts == 0 || selected_per_row > kMaxSelectedExperts) {
     return;
   }
   const auto stream = static_cast<hipStream_t>(ctx.Stream());
 
-  for (std::size_t row = 0; row < rows; ++row) {
-    ::gufo::hip::LaunchGEMV(layer.ffn_gate_inp.data, layer.ffn_gate_inp.type,
-                            x.data() + (row * hidden),
-                            router_logits.data() + (row * experts), experts,
-                            hidden, stream);
-    ::gufo::hip::LaunchMoeRoute(
-        router_logits.data() + (row * experts),
-        expert_ids.data() + (row * kMaxSelectedExperts),
-        expert_weights.data() + (row * kMaxSelectedExperts),
-        static_cast<std::uint32_t>(experts),
-        static_cast<std::uint32_t>(selected_per_row), stream);
+  // The router is a [experts, hidden] fp32 matrix: read once per chunk by one
+  // fp32 GEMM instead of once per row by a GEMV, which at prefill width is the
+  // single largest weight stream in the layer.
+  constexpr std::size_t kRouterGemmRows = 2;
+  const bool router_gemm = rows >= kRouterGemmRows && hipblas != nullptr &&
+                           layer.ffn_gate_inp.type == core::GgmlType::kF32;
+  if (router_gemm) {
+    ::gufo::hip::LaunchHipblasGEMM(
+        static_cast<hipblasHandle_t>(hipblas), layer.ffn_gate_inp.data, false,
+        x.data(), router_logits.data(), rows, experts, hidden, nullptr, stream);
+    ::gufo::hip::LaunchMoeRouteRows(
+        router_logits.data(), expert_ids.data(), expert_weights.data(),
+        static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(experts),
+        static_cast<std::uint32_t>(selected_per_row),
+        static_cast<std::uint32_t>(kMaxSelectedExperts), stream);
+  } else {
+    for (std::size_t row = 0; row < rows; ++row) {
+      ::gufo::hip::LaunchGEMV(layer.ffn_gate_inp.data, layer.ffn_gate_inp.type,
+                              x.data() + (row * hidden),
+                              router_logits.data() + (row * experts), experts,
+                              hidden, stream);
+      ::gufo::hip::LaunchMoeRoute(
+          router_logits.data() + (row * experts),
+          expert_ids.data() + (row * kMaxSelectedExperts),
+          expert_weights.data() + (row * kMaxSelectedExperts),
+          static_cast<std::uint32_t>(experts),
+          static_cast<std::uint32_t>(selected_per_row), stream);
+    }
   }
 
   // One read per layer, not per row: bucketing needs every token's picks.
@@ -431,6 +453,28 @@ void MoeFfnForwardRowsBucketed(
         ::gufo::hip::LaunchGEMV(down_w.data, down_w.type, row_act, row_out,
                                 hidden, expert_ffn, stream);
       }
+    } else if (count >= kMatrixCoreRowsThreshold &&
+               q8_activation.size() >=
+                   ::gufo::hip::QuantizedActivationBytes(count, hidden)) {
+      ::gufo::hip::LaunchMoeGatherRows(x.data(), perm_rows.data() + begin,
+                                       gathered.data(), count, hidden, stream);
+      void* q8_x = q8_activation.data();
+      ::gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(gathered.data(), q8_x,
+                                                        count, hidden, stream);
+      ::gufo::hip::LaunchMoeBucketQuantGEMM(gate_w.type, gate_w.data, q8_x,
+                                            gate_scratch.data(), count,
+                                            expert_ffn, hidden, stream);
+      ::gufo::hip::LaunchMoeBucketQuantGEMM(up_w.type, up_w.data, q8_x,
+                                            up_scratch.data(), count,
+                                            expert_ffn, hidden, stream);
+      // The two GEMMs above have consumed the activation, so the SwiGLU result
+      // takes the same buffer in its Q8_1 form for the down projection.
+      ::gufo::hip::LaunchBatchedFusedSwiGLUQuantizeQ8_1(
+          gate_scratch.data(), up_scratch.data(), q8_x, count, expert_ffn,
+          stream);
+      ::gufo::hip::LaunchMoeBucketQuantGEMM(down_w.type, down_w.data, q8_x,
+                                            expert_out.data(), count, hidden,
+                                            expert_ffn, stream);
     } else {
       ::gufo::hip::LaunchMoeGatherRows(x.data(), perm_rows.data() + begin,
                                        gathered.data(), count, hidden, stream);
@@ -499,17 +543,29 @@ void MoeFfnForwardRowsBucketed(
           act_scratch.data(), expert_out.data(), rows, hidden, shared_ffn,
           stream);
     }
-    // Only the scalar gate stays per row: it is a single fp32 vector, and the
-    // batched entry points ignore fp32 weights.
-    for (std::size_t row = 0; row < rows; ++row) {
-      const std::span<const float> input = x.subspan(row * hidden, hidden);
-      std::span<float> gate_logit = router_logits.subspan(row * experts, 1);
-      ::gufo::hip::LaunchGEMV(layer.ffn_gate_inp_shexp.data,
-                              layer.ffn_gate_inp_shexp.type, input.data(),
-                              gate_logit.data(), 1, hidden, stream);
-      ::gufo::hip::LaunchSigmoidScaledAdd(
-          gate_logit.data(), expert_out.data() + (row * hidden),
-          out.data() + (row * hidden), hidden, stream);
+    // The gate is one fp32 vector per row: wide chunks read it once with a
+    // [rows, 1] GEMM and apply every scale in one kernel; narrow chunks keep
+    // the per-row GEMV, where a GEMM launch would cost more than it saves.
+    const bool gate_gemm =
+        router_gemm && moe_gate.size() >= rows &&
+        layer.ffn_gate_inp_shexp.type == core::GgmlType::kF32;
+    if (gate_gemm) {
+      ::gufo::hip::LaunchHipblasGEMM(
+          static_cast<hipblasHandle_t>(hipblas), layer.ffn_gate_inp_shexp.data,
+          false, x.data(), moe_gate.data(), rows, 1, hidden, nullptr, stream);
+      ::gufo::hip::LaunchSigmoidScaledAddRows(
+          moe_gate.data(), expert_out.data(), out.data(),
+          static_cast<std::uint32_t>(rows), hidden, stream);
+    } else {
+      for (std::size_t row = 0; row < rows; ++row) {
+        std::span<float> gate_logit = router_logits.subspan(row * experts, 1);
+        ::gufo::hip::LaunchGEMV(
+            layer.ffn_gate_inp_shexp.data, layer.ffn_gate_inp_shexp.type,
+            x.data() + (row * hidden), gate_logit.data(), 1, hidden, stream);
+        ::gufo::hip::LaunchSigmoidScaledAdd(
+            gate_logit.data(), expert_out.data() + (row * hidden),
+            out.data() + (row * hidden), hidden, stream);
+      }
     }
   }
 }

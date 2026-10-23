@@ -260,6 +260,16 @@ void LaunchBatchedQuantGEMMPreQuantized(core::GgmlType type, const void* w,
                                         std::size_t k,
                                         hipStream_t stream = nullptr);
 
+/// Expert-bucket GEMM: the same W-quant x A8 matrix-core kernel as
+/// LaunchBatchedQuantGEMMPreQuantized, tiled for a small token count over a
+/// short weight matrix. The dense tile (128 weight rows) leaves this GPU with
+/// eight workgroups at the expert shape, so the MoE buckets use a narrower
+/// weight tile that fills it.
+void LaunchMoeBucketQuantGEMM(core::GgmlType type, const void* w,
+                              const void* q8_1_x, float* y, std::size_t batch,
+                              std::size_t m, std::size_t k,
+                              hipStream_t stream = nullptr);
+
 /// Directly computes dual GEMM:
 ///   Y_gate[B, M] = X_q8_1[B, K] * W_gate[M, K]^T
 ///   Y_up[B, M]   = X_q8_1[B, K] * W_up[M, K]^T

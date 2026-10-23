@@ -234,6 +234,10 @@ struct QwenFfnScratch {
   std::span<std::uint32_t> moe_perm_rows;
   std::span<std::uint32_t> moe_perm_slots;
   std::span<std::uint32_t> moe_expert_offsets;
+  /// One shared-expert gate logit per row.
+  std::span<float> moe_gate;
+  /// hipBLAS handle for the batched fp32 router projection.
+  void* hipblas{nullptr};
   /// Tiled Q8_1 activation scratch, reused by the shared expert's prefill
   /// GEMMs.
   std::span<std::byte> q8_activation;
@@ -323,6 +327,7 @@ public:
   std::uint32_t* d_moe_perm_rows{nullptr};
   std::uint32_t* d_moe_perm_slots{nullptr};
   std::uint32_t* d_moe_expert_offsets{nullptr};
+  float* d_moe_gate{nullptr};
   float* d_ssm_qkv{nullptr};
   float* d_conv_out{nullptr};
   float* d_ssm_gate{nullptr};

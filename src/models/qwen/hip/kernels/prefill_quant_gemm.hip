@@ -1506,6 +1506,73 @@ void LaunchKQuantWmmaGEMM(core::GgmlType type, const void* w,
   }
 }
 
+namespace detail {
+
+template<int BM, int BN>
+void LaunchMoeBucketTile(core::GgmlType type, const void* w, const void* x,
+                         float* y, std::size_t batch, std::size_t m,
+                         std::size_t k, hipStream_t stream) {
+  const dim3 grid(static_cast<unsigned int>((batch + BN - 1) / BN),
+                  static_cast<unsigned int>(m / BM));
+  switch (type) {
+    case core::GgmlType::kQ4_K:
+      WKQuantA8BlockedWmmaGEMMKernel<BM, BN, 4, 2, 4, core::GgmlType::kQ4_K>
+          <<<grid, 256, 0, stream>>>(w, x, y, batch, m, k);
+      return;
+    case core::GgmlType::kQ5_K:
+      WKQuantA8BlockedWmmaGEMMKernel<BM, BN, 4, 2, 4, core::GgmlType::kQ5_K>
+          <<<grid, 256, 0, stream>>>(w, x, y, batch, m, k);
+      return;
+    case core::GgmlType::kQ6_K:
+      WKQuantA8BlockedWmmaGEMMKernel<BM, BN, 4, 2, 4, core::GgmlType::kQ6_K>
+          <<<grid, 256, 0, stream>>>(w, x, y, batch, m, k);
+      return;
+    case core::GgmlType::kQ8_0:
+      WKQuantA8BlockedWmmaGEMMKernel<BM, BN, 4, 2, 4, core::GgmlType::kQ8_0>
+          <<<grid, 256, 0, stream>>>(w, x, y, batch, m, k);
+      return;
+    case core::GgmlType::kIQ4_XS:
+      WKQuantA8BlockedWmmaGEMMKernel<BM, BN, 4, 2, 4, core::GgmlType::kIQ4_XS>
+          <<<grid, 256, 0, stream>>>(w, x, y, batch, m, k);
+      return;
+    default:
+      return;
+  }
+}
+
+}  // namespace detail
+
+void LaunchMoeBucketQuantGEMM(core::GgmlType type, const void* w,
+                              const void* q8_1_x, float* y, std::size_t batch,
+                              std::size_t m, std::size_t k,
+                              hipStream_t stream) {
+  if (batch == 0 || m == 0 || k == 0) {
+    return;
+  }
+  // A bucket is one expert's matrix against the tokens routed to it. At the
+  // expert shape the dense 128-row tile only fills eight workgroups, so this
+  // path uses a 32-row weight tile (32 workgroups) and lets the kernel skip the
+  // token subtiles a small bucket does not use. The token tile follows the
+  // bucket so a wide bucket still streams the weight once.
+  constexpr int kBM = 32;
+  if (m % kBM != 0) {
+    LaunchBatchedQuantGEMMPreQuantized(type, w, q8_1_x, y, batch, m, k, stream);
+    return;
+  }
+  if (batch <= 64) {
+    detail::LaunchMoeBucketTile<kBM, 64>(type, w, q8_1_x, y, batch, m, k,
+                                         stream);
+    return;
+  }
+  if (batch <= 128) {
+    detail::LaunchMoeBucketTile<kBM, 128>(type, w, q8_1_x, y, batch, m, k,
+                                          stream);
+    return;
+  }
+  detail::LaunchMoeBucketTile<kBM, 256>(type, w, q8_1_x, y, batch, m, k,
+                                        stream);
+}
+
 void LaunchBatchedQuantGEMMPreQuantized(core::GgmlType type, const void* w,
                                         const void* q8_1_x, float* y,
                                         std::size_t batch, std::size_t m,

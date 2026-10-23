@@ -15,11 +15,10 @@ constexpr std::uint64_t kRoutingMask = 0xFFFFFFFFFFFFFFFFULL;
 /// candidates live in shared memory so a picked expert can be masked out
 /// between rounds. Ties resolve to the lowest expert index, matching the CPU
 /// reference's first-maximum scan.
-__global__ void MoeRouteKernel(const float* __restrict__ logits,
-                               std::uint32_t* __restrict__ expert_ids,
-                               float* __restrict__ expert_weights,
-                               std::uint32_t expert_count,
-                               std::uint32_t used_count) {
+__device__ void RouteRow(const float* __restrict__ logits,
+                         std::uint32_t* __restrict__ expert_ids,
+                         float* __restrict__ expert_weights,
+                         std::uint32_t expert_count, std::uint32_t used_count) {
   extern __shared__ float probabilities[];
   const std::uint32_t lane = threadIdx.x;
 
@@ -150,7 +149,78 @@ __global__ void SigmoidScaledAddKernel(const float* __restrict__ gate_logit,
   }
 }
 
+__global__ void MoeRouteKernel(const float* __restrict__ logits,
+                               std::uint32_t* __restrict__ expert_ids,
+                               float* __restrict__ expert_weights,
+                               std::uint32_t expert_count,
+                               std::uint32_t used_count) {
+  RouteRow(logits, expert_ids, expert_weights, expert_count, used_count);
+}
+
+/// One routing block per row: the per-row launch was 2048 launches per layer at
+/// prefill width, and routing is cheap enough to batch.
+__global__ void MoeRouteRowsKernel(const float* __restrict__ logits,
+                                   std::uint32_t* __restrict__ expert_ids,
+                                   float* __restrict__ expert_weights,
+                                   std::uint32_t expert_count,
+                                   std::uint32_t used_count,
+                                   std::uint32_t slot_stride) {
+  const std::uint32_t row = blockIdx.x;
+  RouteRow(logits + (static_cast<std::size_t>(row) * expert_count),
+           expert_ids + (static_cast<std::size_t>(row) * slot_stride),
+           expert_weights + (static_cast<std::size_t>(row) * slot_stride),
+           expert_count, used_count);
+}
+
+__global__ void SigmoidScaledAddRowsKernel(
+    const float* __restrict__ gate_logits, const float* __restrict__ expert_out,
+    float* __restrict__ out, std::uint32_t rows, std::size_t hidden) {
+  const std::uint32_t row = blockIdx.y;
+  const float scale = 1.0F / (1.0F + expf(-gate_logits[row]));
+  const float* source = expert_out + (static_cast<std::size_t>(row) * hidden);
+  float* target = out + (static_cast<std::size_t>(row) * hidden);
+  for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < hidden;
+       i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    target[i] += scale * source[i];
+  }
+}
+
 }  // namespace
+
+void LaunchMoeRouteRows(const float* logits, std::uint32_t* expert_ids,
+                        float* expert_weights, std::uint32_t rows,
+                        std::uint32_t expert_count, std::uint32_t used_count,
+                        std::uint32_t slot_stride, hipStream_t stream) {
+  constexpr std::uint32_t kMaxExperts = 8192;
+  if (logits == nullptr || expert_ids == nullptr || expert_weights == nullptr ||
+      rows == 0 || expert_count == 0 || expert_count > kMaxExperts ||
+      used_count == 0) {
+    return;
+  }
+  const std::size_t shared_bytes =
+      static_cast<std::size_t>(expert_count) * sizeof(float);
+  MoeRouteRowsKernel<<<rows, kRoutingLanes, shared_bytes, stream>>>(
+      logits, expert_ids, expert_weights, expert_count, used_count,
+      slot_stride);
+}
+
+void LaunchSigmoidScaledAddRows(const float* gate_logits,
+                                const float* expert_out, float* out,
+                                std::uint32_t rows, std::size_t hidden,
+                                hipStream_t stream) {
+  if (gate_logits == nullptr || expert_out == nullptr || out == nullptr ||
+      rows == 0 || hidden == 0) {
+    return;
+  }
+  constexpr std::uint32_t kThreads = 128;
+  const std::uint32_t blocks =
+      static_cast<std::uint32_t>((hidden + kThreads - 1) / kThreads < 32
+                                     ? (hidden + kThreads - 1) / kThreads
+                                     : 32);
+  const dim3 grid(blocks, rows);
+  SigmoidScaledAddRowsKernel<<<grid, kThreads, 0, stream>>>(
+      gate_logits, expert_out, out, rows, hidden);
+}
 
 void LaunchMoeRoute(const float* logits, std::uint32_t* expert_ids,
                     float* expert_weights, std::uint32_t expert_count,

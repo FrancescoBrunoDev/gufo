@@ -528,7 +528,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             std::span<float>(scratch.ffn.moe_out),
             std::span<float>(scratch.ffn.out), scratch.ffn.moe_gathered,
             scratch.ffn.moe_perm_rows, scratch.ffn.moe_perm_slots,
-            scratch.ffn.moe_expert_offsets, scratch.ffn.q8_activation);
+            scratch.ffn.moe_expert_offsets, scratch.ffn.q8_activation,
+            scratch.ffn.moe_gate, scratch.ffn.hipblas);
       } else {
         gufo::models::qwen::MoeFfnForwardRows(
             gufo::models::qwen::HipModuleContext(arena_.stream), layer, config,

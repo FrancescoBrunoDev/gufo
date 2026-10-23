@@ -222,14 +222,43 @@ same run repeated twice):
 
 | test | per-token routing | bucketed | + 16-row sharing | + batched shared expert | llama.cpp (same GPU) |
 | --- | --- | --- | --- | --- | --- |
-| pp128 | 44.1 | 131.3 | 135.9 | **157.4** | - |
-| pp512 | 44.4 | 160.9 | 170.5 | **206.6** | 530.9 |
-| pp2048 | 43.4 | 162.6 | 175.4 | **212.0** | - |
-| tg8 | 19.5 | 19.6 | 19.6 | 19.6 | - |
+| pp128 | 44.1 | 131.3 | 135.9 | - | 157.4 | **217.3** |
+| pp512 | 44.4 | 160.9 | 170.5 | 195.5 | 206.6 | **369.1** | 530.9 |
+| pp2048 | 43.4 | 162.6 | 175.4 | 198.9 | 212.0 | **453.5** | - |
+| tg8 | 19.5 | 19.6 | 19.6 | 19.6 | 19.6 | 19.6 | - |
 
 The shared-expert step alone is worth 15% of prefill: skipping it entirely
 measured pp512 224.7 and pp2048 230.4, so about half of what it still costs is
 the per-row scalar gate and the Q8_1 quantize passes.
+
+## Prefill: what the stairstep above is made of
+
+Each column that moved is one measured decision, not a guess.
+
+**Wide chunks take the matrix-core route.** `moe_expert_gemm_bench` times both
+backends at the real expert shape (`N=1024, K=3072`). The exact FP32 kernel is
+best at exactly one 16-row pass (57 GB/s) and then degrades linearly, because a
+second 16 rows means a second read of the whole matrix: 14 GB/s at 64 rows. The
+tiled Q8_1 matrix-core route holds 43 GB/s at every width, so buckets of 24 rows
+or more use it, and buckets above 64 rows widen the token tile to 128 and 256 so
+the weight is still streamed once. Narrow buckets keep the exact kernel, which
+wins there (29.2 µs against 38.3 at 16 rows) and keeps the bit-exact activation
+contract the operator test compares against.
+
+**The router is read once per chunk, not once per row.** It is a `[256, 3072]`
+fp32 matrix, 3.1 MB. Forming it row by row cost 1.6 GB per layer at pp512 --
+more than every expert matrix in the layer combined -- so it now goes through one
+fp32 `LaunchHipblasGEMM`. The same reasoning applies to the shared expert's
+scalar gate, which is now one `[rows, 1]` GEMM.
+
+**Routing, the gate scale and the bucketing are batched.** One routing kernel
+per row plus one sigmoid-scale kernel per row was 2048 launches per layer at
+pp2048 width; `LaunchMoeRouteRows` and `LaunchSigmoidScaledAddRows` make it one
+each, worth 28% of pp512 and 35% of pp2048 on its own.
+
+`kernel_resources_test` guards the new instantiations: the same sweep briefly
+moved the dense path's 128-token tile to 64 and that instantiation spilled 348
+bytes of scratch, which the check caught.
 
 Prefill is 3.6-4.9x faster than the per-token routing and now scales with the
 prompt length, because a longer chunk gives every expert more rows per weight

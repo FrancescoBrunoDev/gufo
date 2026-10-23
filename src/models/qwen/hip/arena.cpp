@@ -762,6 +762,7 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
     HIP_CHECK(hipMalloc(
         &d_moe_perm_slots,
         batch * models::qwen::kMaxSelectedExperts * sizeof(std::uint32_t)));
+    HIP_CHECK(hipMalloc(&d_moe_gate, batch * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_moe_expert_offsets,
                         (config_.expert_count + 1) * sizeof(std::uint32_t)));
     HIP_CHECK(hipMalloc(&d_ssm_qkv, batch * projection_width * sizeof(float)));
@@ -922,6 +923,8 @@ QwenGpuScratchView QwenGpuArena::GetScratchView(
                                  batch * models::qwen::kMaxSelectedExperts},
               .moe_expert_offsets = {d_moe_expert_offsets,
                                      config_.expert_count + 1},
+              .moe_gate = {d_moe_gate, batch},
+              .hipblas = hipblas_handle,
               .q8_activation = {static_cast<std::byte*>(d_scratch_q8_act),
                                 QuantizedActivationBytes(
                                     (((batch + 15) / 16) * 16),

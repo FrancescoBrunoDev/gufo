@@ -219,7 +219,8 @@ int main(int argc, char** argv) {
   // one.
   for (const auto [kRows, min_cosine] :
        {std::pair<std::size_t, float>{5, 0.999F},
-        std::pair<std::size_t, float>{32, 0.9995F}}) {
+        std::pair<std::size_t, float>{32, 0.9995F},
+        std::pair<std::size_t, float>{1024, 0.9995F}}) {
     using gufo::models::qwen::kMaxSelectedExperts;
     std::vector<float> rows_x(kRows * hidden);
     for (std::size_t r = 0; r < kRows; ++r) {
@@ -248,6 +249,7 @@ int main(int argc, char** argv) {
     gufo::test::DeviceBuffer<std::uint32_t> dperm_slots(kRows *
                                                         kMaxSelectedExperts);
     gufo::test::DeviceBuffer<std::uint32_t> doffsets(experts + 1);
+    gufo::test::DeviceBuffer<float> dgate_logits(kRows);
     const std::size_t shared_ffn =
         config.shared_expert_feed_forward_length != 0
             ? config.shared_expert_feed_forward_length
@@ -273,7 +275,8 @@ int main(int argc, char** argv) {
         std::span<std::uint32_t>(dperm_slots.data(),
                                  kRows * kMaxSelectedExperts),
         std::span<std::uint32_t>(doffsets.data(), experts + 1),
-        std::span<std::byte>(dq8.data(), dq8.size()));
+        std::span<std::byte>(dq8.data(), dq8.size()),
+        std::span<float>(dgate_logits.data(), kRows), nullptr);
     gufo::models::qwen::MoeFfnForwardRows(
         gufo::models::qwen::HipModuleContext{}, device_layer, config, kRows,
         std::span<const float>(dx.data(), kRows * hidden),

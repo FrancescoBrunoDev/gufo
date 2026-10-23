@@ -82,6 +82,9 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_layer_diff_probe_test
     tests/models/qwen/hip/layer_diff_probe_test.cpp
     "hip;gpu;qwen;moe;model;slow")
+  add_qwen_hip_test(qwen_moe_expert_gemm_bench
+    tests/models/qwen/hip/moe_expert_gemm_bench.cpp
+    "hip;gpu;qwen;moe;bench")
   add_qwen_hip_test(qwen_moe_real_weights_test
     tests/models/qwen/hip/moe_real_weights_test.cpp
     "hip;gpu;qwen;moe;model")

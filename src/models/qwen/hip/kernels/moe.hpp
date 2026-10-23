@@ -16,6 +16,15 @@ void LaunchMoeRoute(const float* logits, std::uint32_t* expert_ids,
                     float* expert_weights, std::uint32_t expert_count,
                     std::uint32_t used_count, hipStream_t stream = nullptr);
 
+/// The same routing for a whole chunk: one block per row. `slot_stride` is the
+/// row stride of the id and weight arrays, which stay `kMaxSelectedExperts`
+/// wide.
+void LaunchMoeRouteRows(const float* logits, std::uint32_t* expert_ids,
+                        float* expert_weights, std::uint32_t rows,
+                        std::uint32_t expert_count, std::uint32_t used_count,
+                        std::uint32_t slot_stride,
+                        hipStream_t stream = nullptr);
+
 /// out += weight * expert_out for one selected expert. `weight` is a device
 /// scalar, so the weighted sum never round-trips through the host.
 void LaunchMoeAccumulate(const float* expert_out, const float* weight,
@@ -43,6 +52,13 @@ void LaunchMoeScatterAccumulate(const float* src, const std::uint32_t* rows,
 void LaunchSigmoidScaledAdd(const float* gate_logit, const float* expert_out,
                             float* out, std::size_t elements,
                             hipStream_t stream = nullptr);
+
+/// The same for a chunk: `gate_logits` holds one scalar per row, and every row
+/// contributes `sigmoid(gate) * expert_out` to `out`.
+void LaunchSigmoidScaledAddRows(const float* gate_logits,
+                                const float* expert_out, float* out,
+                                std::uint32_t rows, std::size_t hidden,
+                                hipStream_t stream = nullptr);
 
 }  // namespace gufo::hip
 
