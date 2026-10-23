@@ -344,9 +344,11 @@ void ForwardSSM(std::span<const float> x_normed, const QwenLayerWeights& layer,
                 std::span<float> ssm_gate_scratch,
                 std::span<float> ssm_out_scratch,
                 std::span<float> out) noexcept {
+  // The recurrent cache holds one slot per DeltaNet layer, exactly like the HIP
+  // arena, so both backends address the same slot for the same trunk layer.
   ForwardSSM(x_normed, MakeQwenSsmParameters(layer, config), ssm_cache,
-             layer_idx, ssm_qkv_scratch, ssm_gate_scratch, ssm_out_scratch,
-             out);
+             config.SsmLayerIndex(layer_idx), ssm_qkv_scratch, ssm_gate_scratch,
+             ssm_out_scratch, out);
 }
 
 }  // namespace gufo::models

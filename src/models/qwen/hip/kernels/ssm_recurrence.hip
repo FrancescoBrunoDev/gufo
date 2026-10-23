@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 #include "src/models/qwen/hip/detail/recurrent_state.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
@@ -269,6 +270,15 @@ void LaunchBatchedSSMConvRecurrence(
     std::size_t batch_size, std::size_t qkv_size, std::uint32_t num_key_heads,
     std::uint32_t num_heads, std::uint32_t key_dim, std::uint32_t val_dim,
     hipStream_t stream, QwenRecurrentStateStorage state_storage) {
+  // The batched recurrence fixes its block at 256 threads, two lanes per state
+  // row holding 64 floats each, and reduces across exactly eight warps. Any
+  // other key width or a value width past 128 rows would read state it never
+  // covered, so reject it instead of returning a plausible wrong answer.
+  if (key_dim != 128 || val_dim > 128) {
+    throw std::invalid_argument(
+        "Qwen batched DeltaNet recurrence needs key_dim 128 and val_dim <= "
+        "128");
+  }
   const std::size_t block_size = 256;
   const std::size_t grid_x = (qkv_size + block_size - 1) / block_size;
   const dim3 conv_grid(static_cast<unsigned int>(grid_x),

@@ -19,7 +19,7 @@ QwenGenerator::QwenGenerator(
                 weights_.config.num_key_value_heads, max_context,
                 weights_.config.head_dim),
       ssm_cache_(
-          weights_.config.num_layers, weights_.config.SsmQkvSize(),
+          weights_.config.SsmLayerCount(), weights_.config.SsmQkvSize(),
           weights_.config.ssm_conv_kernel, weights_.config.ssm_time_step_rank,
           weights_.config.ssm_state_size, weights_.config.SsmValueSize()),
       arena_(weights_.config) {}

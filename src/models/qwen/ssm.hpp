@@ -93,16 +93,18 @@ struct QwenSsmParameters {
 }
 
 /// Computes Qwen 3.5 Gated DeltaNet linear attention from a self-contained
-/// tensor slice. Invalid shapes safely zero-fill `out` without touching state.
+/// tensor slice. `ssm_layer` is the recurrent-state slot, not the trunk layer
+/// index; invalid shapes safely zero-fill `out` without touching state.
 void ForwardSSM(std::span<const float> x_normed,
                 const QwenSsmParameters& parameters, QwenSsmCache& ssm_cache,
-                std::uint32_t layer_idx, std::span<float> ssm_qkv_scratch,
+                std::uint32_t ssm_layer, std::span<float> ssm_qkv_scratch,
                 std::span<float> ssm_gate_scratch,
                 std::span<float> ssm_out_scratch,
                 std::span<float> out) noexcept;
 
-/// Compatibility entry point for whole-layer production callers. It constructs
-/// QwenSsmParameters and delegates to the slice overload above.
+/// Compatibility entry point for whole-layer production callers. `layer_idx` is
+/// the trunk layer index; this maps it to the recurrent slot with
+/// `ModelConfig::SsmLayerIndex` and delegates to the slice overload above.
 void ForwardSSM(std::span<const float> x_normed, const QwenLayerWeights& layer,
                 const core::ModelConfig& config, QwenSsmCache& ssm_cache,
                 std::uint32_t layer_idx, std::span<float> ssm_qkv_scratch,

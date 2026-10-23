@@ -1381,6 +1381,29 @@ void TestBatchedRecurrenceDivergingState(std::size_t batch) {
 
 #endif  // defined(ENGINE_ENABLE_HIP)
 
+// The batched recurrence fixes its block at 256 threads, two lanes per state
+// row and eight warp slots; a shape outside that contract must be rejected
+// instead of silently reading state it never covered.
+void TestBatchedRecurrenceRejectsUnsupportedWidths() {
+  const auto rejected = [](std::uint32_t key_dim, std::uint32_t val_dim) {
+    bool threw = false;
+    try {
+      gufo::hip::LaunchBatchedSSMConvRecurrence(
+          nullptr, nullptr, gufo::hip::QwenRecurrentStateIo{}, nullptr, nullptr,
+          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0,
+          /*batch_size=*/1, /*qkv_size=*/256, /*num_key_heads=*/2,
+          /*num_heads=*/2, key_dim, val_dim, nullptr,
+          gufo::hip::QwenRecurrentStateStorage::kFp32);
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    return threw;
+  };
+  assert(rejected(64, 128) && "narrow key width must be rejected");
+  assert(rejected(128, 256) && "wide value width must be rejected");
+  assert(!rejected(128, 128) && "the 128/128 contract stays accepted");
+}
+
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
   const int device_status = gufo::test::GateHipDevice(
@@ -1389,6 +1412,7 @@ int main() {
     return device_status;
   }
 
+  TestBatchedRecurrenceRejectsUnsupportedWidths();
   TestBatchedSSMConvEquivalence();
   TestConcurrentSsmRecurrence();
   TestRecurrentRollbackRows(false);
