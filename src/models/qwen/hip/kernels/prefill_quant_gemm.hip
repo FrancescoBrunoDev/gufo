@@ -36,6 +36,41 @@ __global__ void QuantizeActivationToQ8_1Kernel(const T* __restrict__ x,
                                      q);
 }
 
+// The same quantization read through a row permutation: a mixture-of-experts
+// bucket is the expert's rows gathered out of the chunk, and quantizing them
+// directly through the index list skips the FP32 staging copy the gather would
+// otherwise write and this kernel would read straight back. Same 32 values,
+// same scale, same store -- bit-identical to the gather followed by
+// QuantizeActivationToQ8_1Kernel.
+__global__ void GatherQuantizeActivationToQ8_1Kernel(
+    const float* __restrict__ x, const std::uint32_t* __restrict__ rows,
+    void* __restrict__ y, std::size_t batch, std::size_t k) {
+  const std::size_t num_blocks = k / 32;
+  const std::size_t b_idx =
+      (blockIdx.x * (blockDim.x >> 5u)) + (threadIdx.x >> 5u);
+  const std::size_t lane_id = threadIdx.x & 31u;
+
+  const std::size_t total_blocks = batch * num_blocks;
+  if (b_idx >= total_blocks) {
+    return;
+  }
+
+  const std::size_t tok = b_idx / num_blocks;
+  const std::size_t blk = b_idx % num_blocks;
+  const std::size_t source_row = (rows != nullptr) ? rows[tok] : tok;
+  const float val = x[(source_row * k) + (blk * 32) + lane_id];
+  float max_abs = fabsf(val);
+  for (int off = 16; off > 0; off >>= 1) {
+    max_abs = fmaxf(max_abs, __shfl_xor(max_abs, off));
+  }
+
+  const float d = max_abs / 127.0F;
+  const float id = (d != 0.0F) ? (1.0F / d) : 0.0F;
+  const int8_t q = static_cast<int8_t>(roundf(val * id));
+
+  StoreQ8ActLane<true>(y, batch, num_blocks, tok, blk, lane_id, d, q);
+}
+
 // opt-c173-norm-quant: optional residual add, RMSNorm, and the tiled Q8_1
 // quantization in one pass.
 //
@@ -1006,6 +1041,24 @@ void LaunchBatchedFusedRMSNormQuantizeQ8_1(
       <<<static_cast<unsigned int>(batch_size), 256, lds_bytes, stream>>>(
           x, residual, weight, sum_out, q8_1_out, batch_size, dim, eps);
   LaunchZeroQ8ActTail<true>(q8_1_out, batch_size, dim, stream);
+}
+
+void LaunchBatchedGatherQuantizeQ8_1(const float* x, const std::uint32_t* rows,
+                                     void* q8_1_out, std::size_t batch,
+                                     std::size_t k, hipStream_t stream) {
+  if (batch == 0 || k == 0 || (k % 32) != 0) {
+    return;
+  }
+  const std::size_t num_blocks = k / 32;
+  const std::size_t total_x_blocks = batch * num_blocks;
+  constexpr unsigned int quant_threads = 256;
+  constexpr unsigned int warps_per_tb = quant_threads / 32;
+  const std::size_t quant_grid =
+      (total_x_blocks + warps_per_tb - 1) / warps_per_tb;
+  ::gufo::hip::GatherQuantizeActivationToQ8_1Kernel<<<
+      static_cast<unsigned int>(quant_grid), quant_threads, 0, stream>>>(
+      x, rows, q8_1_out, batch, k);
+  LaunchZeroQ8ActTail<true>(q8_1_out, batch, k, stream);
 }
 
 void LaunchQuantizeActivationQ8_1FromFp32(const float* fp32_x, void* q8_1_out,

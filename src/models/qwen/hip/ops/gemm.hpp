@@ -242,6 +242,16 @@ void LaunchBatchedFusedRMSNormQuantizeQ8_1(
     void* q8_1_out, std::size_t batch_size, std::size_t dim, float eps,
     hipStream_t stream = nullptr);
 
+/// Quantizes each row of `x`, taken through the permutation in `rows`, into the
+/// tiled Q8_1 activation layout the prefill GEMMs consume. Bit-identical to
+/// gathering the rows into a contiguous FP32 buffer and quantizing that.
+void LaunchBatchedGatherQuantizeQ8_1(const float* x, const std::uint32_t* rows,
+                                     void* q8_1_out, std::size_t batch,
+                                     std::size_t k,
+                                     hipStream_t stream = nullptr);
+
+/// Quantizes a contiguous [batch, k] FP32 activation into the tiled Q8_1
+/// layout.
 void LaunchQuantizeActivationQ8_1FromFp32(const float* fp32_x, void* q8_1_out,
                                           std::size_t batch, std::size_t k,
                                           hipStream_t stream = nullptr);

@@ -355,6 +355,7 @@ void MoeFfnForwardRowsBucketed(
   // fp32 GEMM instead of once per row by a GEMV, which at prefill width is the
   // single largest weight stream in the layer.
   constexpr std::size_t kRouterGemmRows = 2;
+  // TEMPORARY ablation hooks, removed before commit.
   const bool router_gemm = rows >= kRouterGemmRows && hipblas != nullptr &&
                            layer.ffn_gate_inp.type == core::GgmlType::kF32;
   if (router_gemm) {
@@ -582,12 +583,12 @@ void MoeFfnForwardRowsBucketed(
     } else if (count >= kMatrixCoreRowsThreshold &&
                q8_activation_e.size() >=
                    ::gufo::hip::QuantizedActivationBytes(count, hidden)) {
-      ::gufo::hip::LaunchMoeGatherRows(x.data(), perm_rows.data() + begin,
-                                       gathered_e.data(), count, hidden,
-                                       expert_stream_h);
       void* q8_x = q8_activation_e.data();
-      ::gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(
-          gathered_e.data(), q8_x, count, hidden, expert_stream_h);
+      // Quantized straight out of the chunk through the bucket's row list: the
+      // FP32 staging copy the gather used to write is never materialized.
+      ::gufo::hip::LaunchBatchedGatherQuantizeQ8_1(
+          x.data(), perm_rows.data() + begin, q8_x, count, hidden,
+          expert_stream_h);
       ::gufo::hip::LaunchMoeBucketQuantGEMM(
           gate_w.type, gate_w.data, q8_x, gate_scratch_e.data(), count,
           expert_ffn, hidden, expert_stream_h);
