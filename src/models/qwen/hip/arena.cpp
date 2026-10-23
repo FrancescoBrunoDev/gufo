@@ -753,6 +753,17 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
     HIP_CHECK(hipMalloc(
         &d_moe_expert_ids,
         batch * models::qwen::kMaxSelectedExperts * sizeof(std::uint32_t)));
+    // Expert-bucketed prefill: one packed row buffer reused per expert, the
+    // permutation that indexes it, and the CSR offsets over the experts.
+    HIP_CHECK(hipMalloc(&d_moe_gathered, batch * hidden_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(
+        &d_moe_perm_rows,
+        batch * models::qwen::kMaxSelectedExperts * sizeof(std::uint32_t)));
+    HIP_CHECK(hipMalloc(
+        &d_moe_perm_slots,
+        batch * models::qwen::kMaxSelectedExperts * sizeof(std::uint32_t)));
+    HIP_CHECK(hipMalloc(&d_moe_expert_offsets,
+                        (config_.expert_count + 1) * sizeof(std::uint32_t)));
     HIP_CHECK(hipMalloc(&d_ssm_qkv, batch * projection_width * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_conv_out, batch * ssm_qkv_size * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_ssm_gate, batch * recurrent_width * sizeof(float)));
@@ -904,6 +915,13 @@ QwenGpuScratchView QwenGpuArena::GetScratchView(
                               (batch * (config_.expert_count +
                                         models::qwen::kMaxSelectedExperts)),
                           batch * hidden},
+              .moe_gathered = {d_moe_gathered, batch * hidden},
+              .moe_perm_rows = {d_moe_perm_rows,
+                                batch * models::qwen::kMaxSelectedExperts},
+              .moe_perm_slots = {d_moe_perm_slots,
+                                 batch * models::qwen::kMaxSelectedExperts},
+              .moe_expert_offsets = {d_moe_expert_offsets,
+                                     config_.expert_count + 1},
           },
   };
 }
@@ -949,6 +967,10 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_ffn_out = other.d_ffn_out;
   d_moe_scratch = other.d_moe_scratch;
   d_moe_expert_ids = other.d_moe_expert_ids;
+  d_moe_gathered = other.d_moe_gathered;
+  d_moe_perm_rows = other.d_moe_perm_rows;
+  d_moe_perm_slots = other.d_moe_perm_slots;
+  d_moe_expert_offsets = other.d_moe_expert_offsets;
   d_ssm_qkv = other.d_ssm_qkv;
   d_conv_out = other.d_conv_out;
   d_ssm_gate = other.d_ssm_gate;
@@ -998,6 +1020,10 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.d_ffn_out = nullptr;
   other.d_moe_scratch = nullptr;
   other.d_moe_expert_ids = nullptr;
+  other.d_moe_gathered = nullptr;
+  other.d_moe_perm_rows = nullptr;
+  other.d_moe_perm_slots = nullptr;
+  other.d_moe_expert_offsets = nullptr;
   other.d_ssm_qkv = nullptr;
   other.d_conv_out = nullptr;
   other.d_ssm_gate = nullptr;
@@ -1054,9 +1080,12 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     d_ffn_act = other.d_ffn_act;
     d_ffn_out = other.d_ffn_out;
     d_moe_scratch = other.d_moe_scratch;
-    d_moe_expert_ids = other.d_moe_expert_ids;
     d_moe_scratch = other.d_moe_scratch;
     d_moe_expert_ids = other.d_moe_expert_ids;
+    d_moe_gathered = other.d_moe_gathered;
+    d_moe_perm_rows = other.d_moe_perm_rows;
+    d_moe_perm_slots = other.d_moe_perm_slots;
+    d_moe_expert_offsets = other.d_moe_expert_offsets;
     d_ssm_qkv = other.d_ssm_qkv;
     d_conv_out = other.d_conv_out;
     d_ssm_gate = other.d_ssm_gate;
@@ -1106,8 +1135,10 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     other.d_ffn_out = nullptr;
     other.d_moe_scratch = nullptr;
     other.d_moe_expert_ids = nullptr;
-    other.d_moe_scratch = nullptr;
-    other.d_moe_expert_ids = nullptr;
+    other.d_moe_gathered = nullptr;
+    other.d_moe_perm_rows = nullptr;
+    other.d_moe_perm_slots = nullptr;
+    other.d_moe_expert_offsets = nullptr;
     other.d_ssm_qkv = nullptr;
     other.d_conv_out = nullptr;
     other.d_ssm_gate = nullptr;
@@ -1208,6 +1239,14 @@ void QwenGpuArena::FreeAll() noexcept {
     LogCleanupError(hipFree(d_moe_scratch));
   if (d_moe_expert_ids != nullptr)
     LogCleanupError(hipFree(d_moe_expert_ids));
+  if (d_moe_gathered != nullptr)
+    LogCleanupError(hipFree(d_moe_gathered));
+  if (d_moe_perm_rows != nullptr)
+    LogCleanupError(hipFree(d_moe_perm_rows));
+  if (d_moe_perm_slots != nullptr)
+    LogCleanupError(hipFree(d_moe_perm_slots));
+  if (d_moe_expert_offsets != nullptr)
+    LogCleanupError(hipFree(d_moe_expert_offsets));
   if (d_ssm_qkv != nullptr)
     LogCleanupError(hipFree(d_ssm_qkv));
   if (d_conv_out != nullptr)
@@ -1276,6 +1315,10 @@ void QwenGpuArena::FreeAll() noexcept {
   d_ffn_out = nullptr;
   d_moe_scratch = nullptr;
   d_moe_expert_ids = nullptr;
+  d_moe_gathered = nullptr;
+  d_moe_perm_rows = nullptr;
+  d_moe_perm_slots = nullptr;
+  d_moe_expert_offsets = nullptr;
   d_ssm_qkv = nullptr;
   d_conv_out = nullptr;
   d_ssm_gate = nullptr;

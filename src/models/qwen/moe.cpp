@@ -4,8 +4,6 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
-#include <cstdio>
-#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -121,12 +119,6 @@ void MoeFfnForward(const QwenLayerWeights& layer,
   MoeSelection selection;
   MoeRoute(layer.ffn_gate_inp, x.first(hidden), config.expert_count,
            config.expert_used_count, router_logits, &selection);
-  if (std::getenv("GUFO_MOE_DEBUG") != nullptr) {
-    std::printf("DEBUG cpu route:");
-    for (std::uint32_t slot = 0; slot < selection.count; ++slot)
-      std::printf(" %u:%.6f", selection.experts[slot], selection.weights[slot]);
-    std::printf("\n");
-  }
 
   const std::span<const float> input = x.first(hidden);
   for (std::uint32_t slot = 0; slot < selection.count; ++slot) {
@@ -293,15 +285,6 @@ void MoeFfnForwardRows(
     return;
   }
 
-  if (std::getenv("GUFO_MOE_DEBUG") != nullptr) {
-    for (std::size_t row = 0; row < rows; ++row) {
-      std::printf("DEBUG hip route:");
-      for (std::size_t slot = 0; slot < selected_per_row; ++slot)
-        std::printf(" %u:%.6f", host_ids[row * kMaxSelectedExperts + slot],
-                    expert_weights[row * kMaxSelectedExperts + slot]);
-      std::printf("\n");
-    }
-  }
   const bool has_shared_expert = !layer.ffn_gate_shexp.empty();
   for (std::size_t row = 0; row < rows; ++row) {
     const auto selected = std::span<const std::uint32_t>(
@@ -312,6 +295,165 @@ void MoeFfnForwardRows(
                         stream);
     if (has_shared_expert) {
       // The shared-expert scalar gate reuses the tail of this row's logits.
+      LaunchSharedExpert(layer, config, row, x, out, gate_scratch, up_scratch,
+                         act_scratch, expert_out,
+                         router_logits.subspan(row * experts, 1), stream);
+    }
+  }
+}
+
+void MoeFfnForwardRowsBucketed(
+    const HipModuleContext& ctx, const QwenLayerWeights& layer,
+    const core::ModelConfig& config, std::size_t rows, std::span<const float> x,
+    std::span<float> router_logits, std::span<std::uint32_t> expert_ids,
+    std::span<float> expert_weights, std::span<float> gate_scratch,
+    std::span<float> up_scratch, std::span<float> act_scratch,
+    std::span<float> expert_out, std::span<float> out,
+    std::span<float> gathered, std::span<std::uint32_t> perm_rows,
+    std::span<std::uint32_t> perm_slots,
+    std::span<std::uint32_t> expert_offsets) noexcept {
+  const std::size_t hidden = config.hidden_size;
+  const std::size_t experts = config.expert_count;
+  const std::size_t selected_per_row = config.expert_used_count;
+  const std::size_t expert_ffn = config.expert_feed_forward_length;
+  // Buckets below this many rows keep the per-row GEMV chain: the batched GEMM
+  // only pays off once one weight stream serves several tokens.
+  constexpr std::uint32_t kBucketedRowsThreshold = 4;
+  if (rows == 0 || experts == 0 || selected_per_row > kMaxSelectedExperts) {
+    return;
+  }
+  const auto stream = static_cast<hipStream_t>(ctx.Stream());
+
+  for (std::size_t row = 0; row < rows; ++row) {
+    ::gufo::hip::LaunchGEMV(layer.ffn_gate_inp.data, layer.ffn_gate_inp.type,
+                            x.data() + (row * hidden),
+                            router_logits.data() + (row * experts), experts,
+                            hidden, stream);
+    ::gufo::hip::LaunchMoeRoute(
+        router_logits.data() + (row * experts),
+        expert_ids.data() + (row * kMaxSelectedExperts),
+        expert_weights.data() + (row * kMaxSelectedExperts),
+        static_cast<std::uint32_t>(experts),
+        static_cast<std::uint32_t>(selected_per_row), stream);
+  }
+
+  // One read per layer, not per row: bucketing needs every token's picks.
+  const std::size_t per_row = rows * kMaxSelectedExperts;
+  std::vector<std::uint32_t> host_ids(per_row);
+  if (hipStreamSynchronize(stream) != hipSuccess ||
+      hipMemcpy(host_ids.data(), expert_ids.data(),
+                per_row * sizeof(std::uint32_t),
+                hipMemcpyDeviceToHost) != hipSuccess) {
+    return;
+  }
+
+  std::vector<std::uint32_t> counts(experts, 0);
+  for (std::size_t i = 0; i < per_row; ++i) {
+    if (host_ids[i] < experts) {
+      ++counts[host_ids[i]];
+    }
+  }
+  std::vector<std::uint32_t> offsets(experts + 1, 0);
+  for (std::size_t expert = 0; expert < experts; ++expert) {
+    offsets[expert + 1] = offsets[expert] + counts[expert];
+  }
+  std::vector<std::uint32_t> cursor(offsets.begin(), offsets.end() - 1);
+  std::vector<std::uint32_t> packed_rows(per_row);
+  std::vector<std::uint32_t> packed_slots(per_row);
+  for (std::size_t row = 0; row < rows; ++row) {
+    for (std::size_t slot = 0; slot < selected_per_row; ++slot) {
+      const std::uint32_t expert = host_ids[(row * kMaxSelectedExperts) + slot];
+      if (expert >= experts) {
+        continue;
+      }
+      const std::uint32_t packed = cursor[expert]++;
+      packed_rows[packed] = static_cast<std::uint32_t>(row);
+      packed_slots[packed] = static_cast<std::uint32_t>(slot);
+    }
+  }
+  // Blocking uploads: the sources are function-local, so an asynchronous copy
+  // could outlive them.
+  if (hipMemcpy(perm_rows.data(), packed_rows.data(),
+                per_row * sizeof(std::uint32_t),
+                hipMemcpyHostToDevice) != hipSuccess ||
+      hipMemcpy(perm_slots.data(), packed_slots.data(),
+                per_row * sizeof(std::uint32_t),
+                hipMemcpyHostToDevice) != hipSuccess ||
+      hipMemcpy(expert_offsets.data(), offsets.data(),
+                (experts + 1) * sizeof(std::uint32_t),
+                hipMemcpyHostToDevice) != hipSuccess) {
+    return;
+  }
+  if (hipMemsetAsync(out.data(), 0, rows * hidden * sizeof(float), stream) !=
+      hipSuccess) {
+    return;
+  }
+
+  // Per expert: pack its tokens, then run each projection as one batched GEMM.
+  // The routed weight stays on device for the accumulation.
+  for (std::size_t expert = 0; expert < experts; ++expert) {
+    const std::uint32_t begin = offsets[expert];
+    const std::uint32_t count = counts[expert];
+    if (count == 0) {
+      continue;
+    }
+    const auto gate_w =
+        ExpertSlice(layer.ffn_gate_exps, expert, expert_ffn * hidden);
+    const auto up_w =
+        ExpertSlice(layer.ffn_up_exps, expert, expert_ffn * hidden);
+    const auto down_w =
+        ExpertSlice(layer.ffn_down_exps, expert, hidden * expert_ffn);
+    if (gate_w.empty() || up_w.empty() || down_w.empty()) {
+      continue;
+    }
+    if (count < kBucketedRowsThreshold) {
+      // A one- or two-token bucket is common on short prompts and the batched
+      // GEMM gains nothing there, so those rows keep the decode GEMV chain.
+      for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint32_t source_row = packed_rows[begin + i];
+        const float* row_in =
+            x.data() + (static_cast<std::size_t>(source_row) * hidden);
+        float* row_act =
+            act_scratch.data() + (static_cast<std::size_t>(i) * expert_ffn);
+        float* row_out =
+            expert_out.data() + (static_cast<std::size_t>(i) * hidden);
+        float* row_gate =
+            gate_scratch.data() + (static_cast<std::size_t>(i) * expert_ffn);
+        float* row_up =
+            up_scratch.data() + (static_cast<std::size_t>(i) * expert_ffn);
+        ::gufo::hip::LaunchGEMV(gate_w.data, gate_w.type, row_in, row_gate,
+                                expert_ffn, hidden, stream);
+        ::gufo::hip::LaunchGEMV(up_w.data, up_w.type, row_in, row_up,
+                                expert_ffn, hidden, stream);
+        ::gufo::hip::LaunchBatchedSwiGLUActivation(row_gate, row_up, row_act,
+                                                   nullptr, expert_ffn, stream);
+        ::gufo::hip::LaunchGEMV(down_w.data, down_w.type, row_act, row_out,
+                                hidden, expert_ffn, stream);
+      }
+    } else {
+      ::gufo::hip::LaunchMoeGatherRows(x.data(), perm_rows.data() + begin,
+                                       gathered.data(), count, hidden, stream);
+      ::gufo::hip::LaunchBatchedQuantGEMMFp32(
+          gate_w.type, gate_w.data, gathered.data(), gate_scratch.data(), count,
+          expert_ffn, hidden, stream);
+      ::gufo::hip::LaunchBatchedQuantGEMMFp32(
+          up_w.type, up_w.data, gathered.data(), up_scratch.data(), count,
+          expert_ffn, hidden, stream);
+      ::gufo::hip::LaunchBatchedSwiGLUActivation(
+          gate_scratch.data(), up_scratch.data(), act_scratch.data(), nullptr,
+          count * expert_ffn, stream);
+      ::gufo::hip::LaunchBatchedQuantGEMMFp32(
+          down_w.type, down_w.data, act_scratch.data(), expert_out.data(),
+          count, hidden, expert_ffn, stream);
+    }
+    ::gufo::hip::LaunchMoeScatterAccumulate(
+        expert_out.data(), perm_rows.data() + begin, perm_slots.data() + begin,
+        expert_weights.data(), out.data(), count, hidden,
+        static_cast<std::uint32_t>(kMaxSelectedExperts), stream);
+  }
+
+  if (!layer.ffn_gate_shexp.empty()) {
+    for (std::size_t row = 0; row < rows; ++row) {
       LaunchSharedExpert(layer, config, row, x, out, gate_scratch, up_scratch,
                          act_scratch, expert_out,
                          router_logits.subspan(row * experts, 1), stream);

@@ -192,7 +192,7 @@ int main(int argc, char** argv) {
       std::span<float>(cpu_logits), &cpu_selection);
 
   std::cout << "layer " << layer << " experts=" << experts << " used=" << used
-            << " e_ffn=" << expert_ffn
+            << " e_ffn=" << expert_ffn << " inter=" << config.intermediate_size
             << " gate=" << gufo::core::ToString(host_layer.ffn_gate_exps.type)
             << "\n";
   std::cout << "cpu ids: ";
@@ -212,6 +212,90 @@ int main(int argc, char** argv) {
     max_diff = std::max(max_diff, std::fabs(cpu_out[i] - gpu_out[i]));
     cpu_norm += cpu_out[i] * cpu_out[i];
   }
+  // The bucketed prefill must agree with the per-row path on identical input.
+  {
+    constexpr std::size_t kRows = 5;
+    using gufo::models::qwen::kMaxSelectedExperts;
+    std::vector<float> rows_x(kRows * hidden);
+    for (std::size_t r = 0; r < kRows; ++r) {
+      for (std::size_t i = 0; i < hidden; ++i) {
+        // Distinct rows route to different experts, which keeps most buckets
+        // small; a shared scaling would give every row the same eight.
+        rows_x[(r * hidden) + i] =
+            x[i] + (0.35F * static_cast<float>(r) *
+                    std::cos(0.01F * static_cast<float>(i) *
+                             (1.0F + static_cast<float>(r))));
+      }
+    }
+    gufo::test::DeviceBuffer<float> dx(rows_x);
+    gufo::test::DeviceBuffer<float> dlogits(kRows * experts);
+    gufo::test::DeviceBuffer<std::uint32_t> dids(kRows * kMaxSelectedExperts);
+    gufo::test::DeviceBuffer<float> dweights(kRows * kMaxSelectedExperts);
+    gufo::test::DeviceBuffer<float> dgate(kRows * expert_ffn);
+    gufo::test::DeviceBuffer<float> dup(kRows * expert_ffn);
+    gufo::test::DeviceBuffer<float> dact(kRows * expert_ffn);
+    gufo::test::DeviceBuffer<float> dexpert_out(kRows * hidden);
+    gufo::test::DeviceBuffer<float> dout_rows(kRows * hidden);
+    gufo::test::DeviceBuffer<float> dout_bucket(kRows * hidden);
+    gufo::test::DeviceBuffer<float> dgathered(kRows * hidden);
+    gufo::test::DeviceBuffer<std::uint32_t> dperm_rows(kRows *
+                                                       kMaxSelectedExperts);
+    gufo::test::DeviceBuffer<std::uint32_t> dperm_slots(kRows *
+                                                        kMaxSelectedExperts);
+    gufo::test::DeviceBuffer<std::uint32_t> doffsets(experts + 1);
+
+    gufo::models::qwen::MoeFfnForwardRowsBucketed(
+        gufo::models::qwen::HipModuleContext{}, device_layer, config, kRows,
+        std::span<const float>(dx.data(), kRows * hidden),
+        std::span<float>(dlogits.data(), kRows * experts),
+        std::span<std::uint32_t>(dids.data(), kRows * kMaxSelectedExperts),
+        std::span<float>(dweights.data(), kRows * kMaxSelectedExperts),
+        std::span<float>(dgate.data(), kRows * expert_ffn),
+        std::span<float>(dup.data(), kRows * expert_ffn),
+        std::span<float>(dact.data(), kRows * expert_ffn),
+        std::span<float>(dexpert_out.data(), kRows * hidden),
+        std::span<float>(dout_bucket.data(), kRows * hidden),
+        std::span<float>(dgathered.data(), kRows * hidden),
+        std::span<std::uint32_t>(dperm_rows.data(),
+                                 kRows * kMaxSelectedExperts),
+        std::span<std::uint32_t>(dperm_slots.data(),
+                                 kRows * kMaxSelectedExperts),
+        std::span<std::uint32_t>(doffsets.data(), experts + 1));
+    gufo::models::qwen::MoeFfnForwardRows(
+        gufo::models::qwen::HipModuleContext{}, device_layer, config, kRows,
+        std::span<const float>(dx.data(), kRows * hidden),
+        std::span<float>(dlogits.data(), kRows * experts),
+        std::span<std::uint32_t>(dids.data(), kRows * kMaxSelectedExperts),
+        std::span<float>(dweights.data(), kRows * kMaxSelectedExperts),
+        std::span<float>(dgate.data(), kRows * expert_ffn),
+        std::span<float>(dup.data(), kRows * expert_ffn),
+        std::span<float>(dact.data(), kRows * expert_ffn),
+        std::span<float>(dexpert_out.data(), kRows * hidden),
+        std::span<float>(dout_rows.data(), kRows * hidden));
+    HIP_CHECK(hipDeviceSynchronize());
+    const auto rows_host = dout_rows.CopyToHost();
+    const auto bucket_host = dout_bucket.CopyToHost();
+    float bucket_max = 0.0F;
+    float rows_norm = 0.0F;
+    float dot = 0.0F;
+    float bucket_norm = 0.0F;
+    for (std::size_t i = 0; i < rows_host.size(); ++i) {
+      bucket_max =
+          std::max(bucket_max, std::fabs(rows_host[i] - bucket_host[i]));
+      rows_norm += rows_host[i] * rows_host[i];
+      bucket_norm += bucket_host[i] * bucket_host[i];
+      dot += rows_host[i] * bucket_host[i];
+    }
+    const float cosine =
+        dot / std::sqrt(std::max(rows_norm * bucket_norm, 1e-30F));
+    std::cout << "bucketed vs per-row: rows=" << kRows
+              << " max|diff|=" << bucket_max << " cosine=" << cosine << "\n";
+    if (cosine < 0.999F) {
+      std::cout << "bucketed prefill disagrees with the per-row path\n";
+      return 1;
+    }
+  }
+
   std::cout << "cpu[0..5]: ";
   for (std::size_t i = 0; i < 6; ++i) {
     std::cout << cpu_out[i] << " ";

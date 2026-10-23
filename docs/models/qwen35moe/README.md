@@ -177,11 +177,49 @@ projector identity `sha256 a5ff1592...`, and `<|image_pad|>` 248056 matches
 a blue square answers "a large red circle, and inside it a smaller blue square,
 centered".
 
+## Prefill throughput: expert bucketing
+
+The first working prefill routed per token: for every token and every selected
+expert it issued three single-row GEMVs plus an accumulate, roughly
+`rows * used * 5` launches per layer. Prompt processing was therefore flat in the
+prompt length (44.1 / 44.4 / 43.4 tok/s at 128 / 512 / 2048 tokens), the signature
+of a launch-bound path rather than a compute-bound one.
+
+`MoeFfnForwardRowsBucketed` packs the tokens that chose the same expert
+(`LaunchMoeGatherRows`), serves each projection with one batched GEMM
+(`LaunchBatchedQuantGEMMFp32`, which keeps the decode FP32 activation order and
+covers every expert format in this artifact), and accumulates the result with the
+routed weight still on device (`LaunchMoeScatterAccumulate`). One host read of the
+ids per layer, not per row, drives the CSR bucketing.
+
+Two decisions worth keeping:
+
+- buckets smaller than four rows keep the per-row GEMV chain; a batched GEMM over
+  one or two rows buys nothing, and this is the common case on short prompts;
+- the shared expert stays per row. Batching it silently disagreed with the
+  reference at these widths because its Q8_0 small-batch GEMM is tuned for the
+  27B shapes, and at four launches per row against the routed experts'
+  `used * 3` it is not where the time goes.
+
+Measured on the artifact (`gufo bench`, gfx1151, RelWithDebInfo with assertions):
+
+| test | before | after | llama.cpp (same GPU) |
+| --- | --- | --- | --- |
+| pp128 | 44.1 | **131.3** | - |
+| pp512 | 44.4 | **160.9** | 530.9 |
+| pp2048 | 43.4 | **162.6** | - |
+| tg64 | 19.5 | 19.5 | 21.6 |
+
+Prefill is now 3.0-3.7x faster and scales with the prompt length, so it is no
+longer launch bound. The remaining gap to llama.cpp is the grouped GEMM shape:
+this path still runs one GEMM per expert, and the next step is to bucket several
+experts into one tile so a prefill re-reads each weight once.
+
 ## Remaining work
 
-1. **HIP MoE prefill**: expert bucketing plus a grouped GEMM; the dense prefill
-   route table in `hip/kernels/prefill_quant_gemm.hip` is specialized for the
-   27B shapes (5120/17408) and would fall back to generic paths here.
+1. **HIP MoE prefill**: bucketing landed; what is left is the grouped GEMM that
+   puts several experts in one tile instead of one GEMM per expert. The batched
+   shared expert is the other half of the same effort (see above).
 3. **Weight residency**: `hip/model_loader.cpp` copies every GGUF region into
    anonymous memory before `hipHostRegister`. The source pages are dropped as
    they are copied, so residency is about 74 GiB rather than 2×; reuse

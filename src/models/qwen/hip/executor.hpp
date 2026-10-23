@@ -228,6 +228,12 @@ struct QwenFfnScratch {
   std::span<std::uint32_t> expert_ids;
   std::span<float> expert_weights;
   std::span<float> moe_out;
+  // Expert-bucketed prefill: the packed rows of one expert, the permutation
+  // that produced them, and the CSR offsets over the expert range.
+  std::span<float> moe_gathered;
+  std::span<std::uint32_t> moe_perm_rows;
+  std::span<std::uint32_t> moe_perm_slots;
+  std::span<std::uint32_t> moe_expert_offsets;
 };
 
 /// Typed non-owning capability views over stable Qwen GPU arena allocations.
@@ -310,6 +316,10 @@ public:
   /// one expert's output share one allocation; the ids get their own.
   float* d_moe_scratch{nullptr};
   std::uint32_t* d_moe_expert_ids{nullptr};
+  float* d_moe_gathered{nullptr};
+  std::uint32_t* d_moe_perm_rows{nullptr};
+  std::uint32_t* d_moe_perm_slots{nullptr};
+  std::uint32_t* d_moe_expert_offsets{nullptr};
   float* d_ssm_qkv{nullptr};
   float* d_conv_out{nullptr};
   float* d_ssm_gate{nullptr};

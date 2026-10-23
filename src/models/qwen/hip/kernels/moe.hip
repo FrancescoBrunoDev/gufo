@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -102,6 +103,41 @@ __global__ void MoeAccumulateKernel(const float* __restrict__ expert_out,
   }
 }
 
+/// Packs the rows that chose one expert so a batched GEMM sees them
+/// contiguously.
+__global__ void MoeGatherRowsKernel(const float* __restrict__ x,
+                                    const std::uint32_t* __restrict__ rows,
+                                    float* __restrict__ dst,
+                                    std::uint32_t count, std::size_t hidden) {
+  const std::size_t total = static_cast<std::size_t>(count) * hidden;
+  for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < total;
+       i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    const std::size_t row = i / hidden;
+    const std::size_t column = i - (row * hidden);
+    dst[i] = x[(static_cast<std::size_t>(rows[row]) * hidden) + column];
+  }
+}
+
+/// Weighted accumulation of a packed expert result back onto its token. The
+/// selected weight stays in device memory.
+__global__ void MoeScatterAccumulateKernel(
+    const float* __restrict__ src, const std::uint32_t* __restrict__ rows,
+    const std::uint32_t* __restrict__ slots, const float* __restrict__ weights,
+    float* __restrict__ out, std::uint32_t count, std::size_t hidden,
+    std::uint32_t slot_stride) {
+  const std::size_t total = static_cast<std::size_t>(count) * hidden;
+  for (std::size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < total;
+       i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    const std::size_t row = i / hidden;
+    const std::size_t column = i - (row * hidden);
+    const std::uint32_t token = rows[row];
+    const float scale =
+        weights[(static_cast<std::size_t>(token) * slot_stride) + slots[row]];
+    atomicAdd(&out[(static_cast<std::size_t>(token) * hidden) + column],
+              scale * src[i]);
+  }
+}
+
 /// out += sigmoid(gate_logit) * expert_out for the shared expert.
 __global__ void SigmoidScaledAddKernel(const float* __restrict__ gate_logit,
                                        const float* __restrict__ expert_out,
@@ -159,6 +195,36 @@ void LaunchMoeAccumulate(const float* expert_out, const float* weight,
                                                                  : 1024),
                         kThreads, 0, stream>>>(expert_out, weight, out,
                                                elements);
+}
+
+void LaunchMoeGatherRows(const float* x, const std::uint32_t* rows, float* dst,
+                         std::uint32_t count, std::size_t hidden,
+                         hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 256;
+  if (count == 0 || hidden == 0) {
+    return;
+  }
+  const std::size_t total = static_cast<std::size_t>(count) * hidden;
+  const std::uint32_t blocks = static_cast<std::uint32_t>(
+      std::min<std::size_t>((total + kThreads - 1) / kThreads, 1024));
+  MoeGatherRowsKernel<<<blocks, kThreads, 0, stream>>>(x, rows, dst, count,
+                                                       hidden);
+}
+
+void LaunchMoeScatterAccumulate(const float* src, const std::uint32_t* rows,
+                                const std::uint32_t* slots,
+                                const float* weights, float* out,
+                                std::uint32_t count, std::size_t hidden,
+                                std::uint32_t slot_stride, hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 256;
+  if (count == 0 || hidden == 0) {
+    return;
+  }
+  const std::size_t total = static_cast<std::size_t>(count) * hidden;
+  const std::uint32_t blocks = static_cast<std::uint32_t>(
+      std::min<std::size_t>((total + kThreads - 1) / kThreads, 1024));
+  MoeScatterAccumulateKernel<<<blocks, kThreads, 0, stream>>>(
+      src, rows, slots, weights, out, count, hidden, slot_stride);
 }
 
 }  // namespace gufo::hip

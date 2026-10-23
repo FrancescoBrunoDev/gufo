@@ -511,17 +511,38 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                            static_cast<const float*>(layer.ffn_norm.data),
                            arena_.d_normed, nullptr, batch_size, hidden_size,
                            eps, arena_.stream);
-      gufo::models::qwen::MoeFfnForwardRows(
-          gufo::models::qwen::HipModuleContext(arena_.stream), layer, config,
-          batch_size,
-          std::span<const float>(arena_.d_normed, batch_size * hidden_size),
-          std::span<float>(scratch.ffn.router_logits),
-          std::span<std::uint32_t>(scratch.ffn.expert_ids),
-          std::span<float>(scratch.ffn.expert_weights),
-          std::span<float>(scratch.ffn.gate), std::span<float>(scratch.ffn.up),
-          std::span<float>(scratch.ffn.activation),
-          std::span<float>(scratch.ffn.moe_out),
-          std::span<float>(scratch.ffn.out));
+      if (batch_size > 1) {
+        // Pack the tokens that chose the same expert and serve each projection
+        // with one batched GEMM, instead of three single-row GEMVs per token
+        // per expert.
+        gufo::models::qwen::MoeFfnForwardRowsBucketed(
+            gufo::models::qwen::HipModuleContext(arena_.stream), layer, config,
+            batch_size,
+            std::span<const float>(arena_.d_normed, batch_size * hidden_size),
+            std::span<float>(scratch.ffn.router_logits),
+            std::span<std::uint32_t>(scratch.ffn.expert_ids),
+            std::span<float>(scratch.ffn.expert_weights),
+            std::span<float>(scratch.ffn.gate),
+            std::span<float>(scratch.ffn.up),
+            std::span<float>(scratch.ffn.activation),
+            std::span<float>(scratch.ffn.moe_out),
+            std::span<float>(scratch.ffn.out), scratch.ffn.moe_gathered,
+            scratch.ffn.moe_perm_rows, scratch.ffn.moe_perm_slots,
+            scratch.ffn.moe_expert_offsets);
+      } else {
+        gufo::models::qwen::MoeFfnForwardRows(
+            gufo::models::qwen::HipModuleContext(arena_.stream), layer, config,
+            batch_size,
+            std::span<const float>(arena_.d_normed, batch_size * hidden_size),
+            std::span<float>(scratch.ffn.router_logits),
+            std::span<std::uint32_t>(scratch.ffn.expert_ids),
+            std::span<float>(scratch.ffn.expert_weights),
+            std::span<float>(scratch.ffn.gate),
+            std::span<float>(scratch.ffn.up),
+            std::span<float>(scratch.ffn.activation),
+            std::span<float>(scratch.ffn.moe_out),
+            std::span<float>(scratch.ffn.out));
+      }
       LaunchBatchedResidualAdd(arena_.d_hidden, arena_.d_ffn_out,
                                arena_.d_hidden, batch_size, hidden_size,
                                arena_.stream);

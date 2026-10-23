@@ -22,6 +22,22 @@ void LaunchMoeAccumulate(const float* expert_out, const float* weight,
                          float* out, std::size_t elements,
                          hipStream_t stream = nullptr);
 
+/// Copies `count` rows of `x` picked by `rows` into a packed buffer, so one
+/// batched GEMM can serve every token that routed to the same expert.
+void LaunchMoeGatherRows(const float* x, const std::uint32_t* rows, float* dst,
+                         std::uint32_t count, std::size_t hidden,
+                         hipStream_t stream = nullptr);
+
+/// out[rows[i]] += weights[rows[i] * slot_stride + slots[i]] * src[i] for every
+/// packed row `i`. Entries of one token can reach this kernel from different
+/// blocks, so the accumulation is atomic per element.
+void LaunchMoeScatterAccumulate(const float* src, const std::uint32_t* rows,
+                                const std::uint32_t* slots,
+                                const float* weights, float* out,
+                                std::uint32_t count, std::size_t hidden,
+                                std::uint32_t slot_stride,
+                                hipStream_t stream = nullptr);
+
 /// out += sigmoid(gate[0]) * expert_out, with the gate logit read from device
 /// memory. Used by the shared expert of a mixture-of-experts FFN.
 void LaunchSigmoidScaledAdd(const float* gate_logit, const float* expert_out,

@@ -65,6 +65,23 @@ void MoeFfnForwardRows(
     std::span<float> up_scratch, std::span<float> act_scratch,
     std::span<float> expert_out, std::span<float> out) noexcept;
 
+/// Expert-bucketed variant for a prefill batch. Same routing and numerics as
+/// `MoeFfnForwardRows`, but the tokens that chose one expert are packed with
+/// `LaunchMoeGatherRows` and served by one batched GEMM per expert, so the
+/// launch count per layer drops from `rows * used * 3` to `experts * 3`.
+/// `gathered` holds `rows * hidden`, `perm_rows`/`perm_slots`
+/// `rows * kMaxSelectedExperts`, and `expert_offsets` `expert_count + 1`.
+void MoeFfnForwardRowsBucketed(
+    const HipModuleContext& ctx, const QwenLayerWeights& layer,
+    const core::ModelConfig& config, std::size_t rows, std::span<const float> x,
+    std::span<float> router_logits, std::span<std::uint32_t> expert_ids,
+    std::span<float> expert_weights, std::span<float> gate_scratch,
+    std::span<float> up_scratch, std::span<float> act_scratch,
+    std::span<float> expert_out, std::span<float> out,
+    std::span<float> gathered, std::span<std::uint32_t> perm_rows,
+    std::span<std::uint32_t> perm_slots,
+    std::span<std::uint32_t> expert_offsets) noexcept;
+
 }  // namespace gufo::models::qwen
 
 #endif  // GUFO_MODELS_QWEN_MOE_HPP_
