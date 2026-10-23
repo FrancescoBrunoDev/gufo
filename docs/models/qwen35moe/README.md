@@ -256,16 +256,23 @@ per row plus one sigmoid-scale kernel per row was 2048 launches per layer at
 pp2048 width; `LaunchMoeRouteRows` and `LaunchSigmoidScaledAddRows` make it one
 each, worth 28% of pp512 and 35% of pp2048 on its own.
 
-**Where the remaining time is.** Skipping the routed experts entirely measures
-pp512 1455 tok/s and pp2048 892 tok/s, so the experts are 49% of pp2048 and 75%
-of pp512; the rest is attention, the DeltaNet recurrence and the dense
-projections. Both halves are still four times less efficient per FLOP than the
-dense 27B layer, which is the next thing to measure rather than guess at: the
-expert kernel streams Q4_K at 43 GB/s where the hardware sustains about 240,
-and the non-expert path is already fully batched -- no per-row launches are left
-to remove. Closing either needs kernel work (a per-launch grid over all buckets
-so the 32-block launches stop paying a tail on every expert, and a wider
-streaming dequant), not scheduling changes.
+**Where the remaining time is.** Two ablations, each with the model still
+running so the shapes are unchanged: skipping the routed experts measures pp512
+1455 tok/s and pp2048 892 tok/s, and skipping the twelve full-attention layers
+measures pp512 362 and pp2048 608. So at pp512 the experts are 75% of the chunk
+and attention is 2%; at pp2048 the experts are 44% and attention is 25%, the
+rest being the DeltaNet recurrence and the dense projections.
+
+That split explains the pp curve. It also says the expert path is no longer the
+place to look for a large win at short prompts: `moe_expert_gemm_bench` measures
+the three projections of a sixteen-token bucket at 65 GB/s per byte read (gate
+and up at 57, down at 69), against about 68 GB/s for llama.cpp. Two things are
+still on the table. At long context the twelve full-attention layers fall back
+to `prefill_baseline` because `IsTiledAttentionSupported` only accepts 24 query
+heads and 4 KV heads (the Flash-Next shape), while this model has 32 and 2; the
+dispatch telemetry says so directly. And every expert is still its own kernel
+launch, so a bucket of 32 blocks pays a tail on a 20-WGP part 256 times per
+layer -- a grid over all buckets of a layer would remove it.
 
 `kernel_resources_test` guards the new instantiations: the same sweep briefly
 moved the dense path's 128-token tile to 64 and that instantiation spilled 348

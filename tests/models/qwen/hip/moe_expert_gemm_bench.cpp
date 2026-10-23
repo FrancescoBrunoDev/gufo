@@ -19,8 +19,14 @@
 
 namespace {
 
-constexpr std::size_t kExpertsWidth = 1024;  // expert_feed_forward_length
-constexpr std::size_t kHidden = 3072;        // hidden_size
+// The two expert shapes: gate/up are [expert_ffn, hidden] and down is
+// [hidden, expert_ffn].
+struct Shape {
+  const char* name;
+  std::size_t m;
+  std::size_t k;
+};
+constexpr Shape kShapes[] = {{"gate_up", 1024, 3072}, {"down", 3072, 1024}};
 
 float ElapsedUs(hipEvent_t start, hipEvent_t stop) {
   float ms = 0.0F;
@@ -68,133 +74,137 @@ int main() {
   HIP_CHECK(hipEventCreate(&start));
   HIP_CHECK(hipEventCreate(&stop));
 
-  for (const Case& bench_case : cases) {
-    const std::size_t row_bytes =
-        ::gufo::quant::QuantizedRowBytes(bench_case.type, kHidden);
-    if (row_bytes == 0) {
-      std::printf("%s: unsupported type\n", bench_case.name);
-      continue;
-    }
-    std::vector<std::byte> host_weight(row_bytes * kExpertsWidth);
-    FillFinite(bench_case.type, host_weight);
-    void* dev_weight = nullptr;
-    HIP_CHECK(hipMalloc(&dev_weight, host_weight.size()));
-    HIP_CHECK(hipMemcpy(dev_weight, host_weight.data(), host_weight.size(),
-                        hipMemcpyHostToDevice));
-    const double weight_gb =
-        static_cast<double>(host_weight.size()) / (1024.0 * 1024.0 * 1024.0);
-
-    std::printf("\n%s  N=%zu K=%zu  weight=%.1f MiB\n", bench_case.name,
-                kExpertsWidth, kHidden,
-                static_cast<double>(host_weight.size()) / (1024.0 * 1024.0));
-    std::printf("%6s %11s %11s %11s %10s %10s %10s %8s\n", "batch",
-                "exact_fp32", "q8_dense", "q8_moe", "exact GB/s", "dense GB/s",
-                "moe GB/s", "cos");
-
-    for (const std::size_t batch : batches) {
-      const std::size_t x_elems = batch * kHidden;
-      const std::size_t y_elems = batch * kExpertsWidth;
-      std::vector<float> host_x(x_elems);
-      for (std::size_t i = 0; i < x_elems; ++i) {
-        host_x[i] = 0.05F * std::sin(0.017F * static_cast<float>(i));
+  for (const Shape& shape : kShapes) {
+    const std::size_t kExpertsWidth = shape.m;
+    const std::size_t kHidden = shape.k;
+    for (const Case& bench_case : cases) {
+      const std::size_t row_bytes =
+          ::gufo::quant::QuantizedRowBytes(bench_case.type, kHidden);
+      if (row_bytes == 0) {
+        std::printf("%s: unsupported type\n", bench_case.name);
+        continue;
       }
-      float* dev_x = nullptr;
-      void* dev_q8 = nullptr;
-      float* dev_y = nullptr;
-      float* dev_y_ref = nullptr;
-      HIP_CHECK(hipMalloc(&dev_x, x_elems * sizeof(float)));
-      HIP_CHECK(hipMalloc(&dev_y, y_elems * sizeof(float)));
-      HIP_CHECK(hipMalloc(&dev_y_ref, y_elems * sizeof(float)));
-      HIP_CHECK(hipMalloc(&dev_q8,
-                          gufo::hip::QuantizedActivationBytes(batch, kHidden)));
-      HIP_CHECK(hipMemcpy(dev_x, host_x.data(), x_elems * sizeof(float),
+      std::vector<std::byte> host_weight(row_bytes * kExpertsWidth);
+      FillFinite(bench_case.type, host_weight);
+      void* dev_weight = nullptr;
+      HIP_CHECK(hipMalloc(&dev_weight, host_weight.size()));
+      HIP_CHECK(hipMemcpy(dev_weight, host_weight.data(), host_weight.size(),
                           hipMemcpyHostToDevice));
+      const double weight_gb =
+          static_cast<double>(host_weight.size()) / (1024.0 * 1024.0 * 1024.0);
 
-      hipStream_t stream = nullptr;
-      for (int warm = 0; warm < 3; ++warm) {
-        gufo::hip::LaunchBatchedQuantGEMMFp32(bench_case.type, dev_weight,
-                                              dev_x, dev_y_ref, batch,
+      std::printf("\n%s %s  N=%zu K=%zu  weight=%.1f MiB\n", bench_case.name,
+                  shape.name, kExpertsWidth, kHidden,
+                  static_cast<double>(host_weight.size()) / (1024.0 * 1024.0));
+      std::printf("%6s %11s %11s %11s %10s %10s %10s %8s\n", "batch",
+                  "exact_fp32", "q8_dense", "q8_moe", "exact GB/s",
+                  "dense GB/s", "moe GB/s", "cos");
+
+      for (const std::size_t batch : batches) {
+        const std::size_t x_elems = batch * kHidden;
+        const std::size_t y_elems = batch * kExpertsWidth;
+        std::vector<float> host_x(x_elems);
+        for (std::size_t i = 0; i < x_elems; ++i) {
+          host_x[i] = 0.05F * std::sin(0.017F * static_cast<float>(i));
+        }
+        float* dev_x = nullptr;
+        void* dev_q8 = nullptr;
+        float* dev_y = nullptr;
+        float* dev_y_ref = nullptr;
+        HIP_CHECK(hipMalloc(&dev_x, x_elems * sizeof(float)));
+        HIP_CHECK(hipMalloc(&dev_y, y_elems * sizeof(float)));
+        HIP_CHECK(hipMalloc(&dev_y_ref, y_elems * sizeof(float)));
+        HIP_CHECK(hipMalloc(
+            &dev_q8, gufo::hip::QuantizedActivationBytes(batch, kHidden)));
+        HIP_CHECK(hipMemcpy(dev_x, host_x.data(), x_elems * sizeof(float),
+                            hipMemcpyHostToDevice));
+
+        hipStream_t stream = nullptr;
+        for (int warm = 0; warm < 3; ++warm) {
+          gufo::hip::LaunchBatchedQuantGEMMFp32(bench_case.type, dev_weight,
+                                                dev_x, dev_y_ref, batch,
+                                                kExpertsWidth, kHidden, stream);
+        }
+        HIP_CHECK(hipEventRecord(start, stream));
+        for (int i = 0; i < kIterations; ++i) {
+          gufo::hip::LaunchBatchedQuantGEMMFp32(bench_case.type, dev_weight,
+                                                dev_x, dev_y_ref, batch,
+                                                kExpertsWidth, kHidden, stream);
+        }
+        HIP_CHECK(hipEventRecord(stop, stream));
+        HIP_CHECK(hipStreamSynchronize(stream));
+        const float exact_us = ElapsedUs(start, stop) / kIterations;
+
+        for (int warm = 0; warm < 3; ++warm) {
+          gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(dev_x, dev_q8, batch,
+                                                          kHidden, stream);
+          gufo::hip::LaunchBatchedQuantGEMMPreQuantized(
+              bench_case.type, dev_weight, dev_q8, dev_y, batch, kExpertsWidth,
+              kHidden, stream);
+        }
+        HIP_CHECK(hipEventRecord(start, stream));
+        for (int i = 0; i < kIterations; ++i) {
+          gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(dev_x, dev_q8, batch,
+                                                          kHidden, stream);
+          gufo::hip::LaunchBatchedQuantGEMMPreQuantized(
+              bench_case.type, dev_weight, dev_q8, dev_y, batch, kExpertsWidth,
+              kHidden, stream);
+        }
+        HIP_CHECK(hipEventRecord(stop, stream));
+        HIP_CHECK(hipStreamSynchronize(stream));
+        const float q8_us = ElapsedUs(start, stop) / kIterations;
+
+        float* dev_y_moe = nullptr;
+        HIP_CHECK(hipMalloc(&dev_y_moe, y_elems * sizeof(float)));
+        for (int warm = 0; warm < 3; ++warm) {
+          gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(dev_x, dev_q8, batch,
+                                                          kHidden, stream);
+          gufo::hip::LaunchMoeBucketQuantGEMM(bench_case.type, dev_weight,
+                                              dev_q8, dev_y_moe, batch,
                                               kExpertsWidth, kHidden, stream);
-      }
-      HIP_CHECK(hipEventRecord(start, stream));
-      for (int i = 0; i < kIterations; ++i) {
-        gufo::hip::LaunchBatchedQuantGEMMFp32(bench_case.type, dev_weight,
-                                              dev_x, dev_y_ref, batch,
+        }
+        HIP_CHECK(hipEventRecord(start, stream));
+        for (int i = 0; i < kIterations; ++i) {
+          gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(dev_x, dev_q8, batch,
+                                                          kHidden, stream);
+          gufo::hip::LaunchMoeBucketQuantGEMM(bench_case.type, dev_weight,
+                                              dev_q8, dev_y_moe, batch,
                                               kExpertsWidth, kHidden, stream);
-      }
-      HIP_CHECK(hipEventRecord(stop, stream));
-      HIP_CHECK(hipStreamSynchronize(stream));
-      const float exact_us = ElapsedUs(start, stop) / kIterations;
+        }
+        HIP_CHECK(hipEventRecord(stop, stream));
+        HIP_CHECK(hipStreamSynchronize(stream));
+        const float moe_us = ElapsedUs(start, stop) / kIterations;
 
-      for (int warm = 0; warm < 3; ++warm) {
-        gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(dev_x, dev_q8, batch,
-                                                        kHidden, stream);
-        gufo::hip::LaunchBatchedQuantGEMMPreQuantized(
-            bench_case.type, dev_weight, dev_q8, dev_y, batch, kExpertsWidth,
-            kHidden, stream);
-      }
-      HIP_CHECK(hipEventRecord(start, stream));
-      for (int i = 0; i < kIterations; ++i) {
-        gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(dev_x, dev_q8, batch,
-                                                        kHidden, stream);
-        gufo::hip::LaunchBatchedQuantGEMMPreQuantized(
-            bench_case.type, dev_weight, dev_q8, dev_y, batch, kExpertsWidth,
-            kHidden, stream);
-      }
-      HIP_CHECK(hipEventRecord(stop, stream));
-      HIP_CHECK(hipStreamSynchronize(stream));
-      const float q8_us = ElapsedUs(start, stop) / kIterations;
+        std::vector<float> host_y(y_elems);
+        std::vector<float> host_ref(y_elems);
+        HIP_CHECK(hipMemcpy(host_y.data(), dev_y, y_elems * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(host_ref.data(), dev_y_ref, y_elems * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        double dot = 0.0;
+        double ref_norm = 0.0;
+        double q8_norm = 0.0;
+        for (std::size_t i = 0; i < y_elems; ++i) {
+          dot += static_cast<double>(host_y[i]) * host_ref[i];
+          ref_norm += static_cast<double>(host_ref[i]) * host_ref[i];
+          q8_norm += static_cast<double>(host_y[i]) * host_y[i];
+        }
+        const double cosine =
+            dot / std::sqrt(std::max(ref_norm * q8_norm, 1e-30));
 
-      float* dev_y_moe = nullptr;
-      HIP_CHECK(hipMalloc(&dev_y_moe, y_elems * sizeof(float)));
-      for (int warm = 0; warm < 3; ++warm) {
-        gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(dev_x, dev_q8, batch,
-                                                        kHidden, stream);
-        gufo::hip::LaunchMoeBucketQuantGEMM(bench_case.type, dev_weight, dev_q8,
-                                            dev_y_moe, batch, kExpertsWidth,
-                                            kHidden, stream);
-      }
-      HIP_CHECK(hipEventRecord(start, stream));
-      for (int i = 0; i < kIterations; ++i) {
-        gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(dev_x, dev_q8, batch,
-                                                        kHidden, stream);
-        gufo::hip::LaunchMoeBucketQuantGEMM(bench_case.type, dev_weight, dev_q8,
-                                            dev_y_moe, batch, kExpertsWidth,
-                                            kHidden, stream);
-      }
-      HIP_CHECK(hipEventRecord(stop, stream));
-      HIP_CHECK(hipStreamSynchronize(stream));
-      const float moe_us = ElapsedUs(start, stop) / kIterations;
+        std::printf("%6zu %9.1fus %9.1fus %9.1fus %10.1f %10.1f %10.1f %8.5f\n",
+                    batch, exact_us, q8_us, moe_us,
+                    weight_gb / (exact_us * 1e-6), weight_gb / (q8_us * 1e-6),
+                    weight_gb / (moe_us * 1e-6), cosine);
 
-      std::vector<float> host_y(y_elems);
-      std::vector<float> host_ref(y_elems);
-      HIP_CHECK(hipMemcpy(host_y.data(), dev_y, y_elems * sizeof(float),
-                          hipMemcpyDeviceToHost));
-      HIP_CHECK(hipMemcpy(host_ref.data(), dev_y_ref, y_elems * sizeof(float),
-                          hipMemcpyDeviceToHost));
-      double dot = 0.0;
-      double ref_norm = 0.0;
-      double q8_norm = 0.0;
-      for (std::size_t i = 0; i < y_elems; ++i) {
-        dot += static_cast<double>(host_y[i]) * host_ref[i];
-        ref_norm += static_cast<double>(host_ref[i]) * host_ref[i];
-        q8_norm += static_cast<double>(host_y[i]) * host_y[i];
+        HIP_CHECK(hipFree(dev_x));
+        HIP_CHECK(hipFree(dev_q8));
+        HIP_CHECK(hipFree(dev_y));
+        HIP_CHECK(hipFree(dev_y_ref));
+        HIP_CHECK(hipFree(dev_y_moe));
       }
-      const double cosine =
-          dot / std::sqrt(std::max(ref_norm * q8_norm, 1e-30));
-
-      std::printf("%6zu %9.1fus %9.1fus %9.1fus %10.1f %10.1f %10.1f %8.5f\n",
-                  batch, exact_us, q8_us, moe_us, weight_gb / (exact_us * 1e-6),
-                  weight_gb / (q8_us * 1e-6), weight_gb / (moe_us * 1e-6),
-                  cosine);
-
-      HIP_CHECK(hipFree(dev_x));
-      HIP_CHECK(hipFree(dev_q8));
-      HIP_CHECK(hipFree(dev_y));
-      HIP_CHECK(hipFree(dev_y_ref));
-      HIP_CHECK(hipFree(dev_y_moe));
+      HIP_CHECK(hipFree(dev_weight));
     }
-    HIP_CHECK(hipFree(dev_weight));
   }
 
   HIP_CHECK(hipEventDestroy(start));
