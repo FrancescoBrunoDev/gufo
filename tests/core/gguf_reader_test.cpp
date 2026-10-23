@@ -264,6 +264,51 @@ void TestBasicGgufParsing() {
   Expect(config->IsValidQwen(), "IsValidQwen true");
 }
 
+void TestQwen35MoeConfig() {
+  // Ornith 1.5 122B shape: a MoE GGUF carries no <arch>.feed_forward_length, so
+  // the per-expert width must become the FFN width every GEMM is sized for.
+  GgufBuilder builder;
+  builder.AddMetadataString("general.architecture", "qwen35moe");
+  builder.AddMetadataUint32("qwen35moe.block_count", 49);
+  builder.AddMetadataUint32("qwen35moe.embedding_length", 3072);
+  builder.AddMetadataUint32("qwen35moe.attention.head_count", 32);
+  builder.AddMetadataUint32("qwen35moe.attention.head_count_kv", 2);
+  builder.AddMetadataUint32("qwen35moe.attention.key_length", 256);
+  builder.AddMetadataUint32("qwen35moe.context_length", 262144);
+  builder.AddMetadataUint32("qwen35moe.full_attention_interval", 4);
+  builder.AddMetadataUint32("qwen35moe.nextn_predict_layers", 1);
+  builder.AddMetadataUint32("qwen35moe.expert_count", 256);
+  builder.AddMetadataUint32("qwen35moe.expert_used_count", 8);
+  builder.AddMetadataUint32("qwen35moe.expert_feed_forward_length", 1024);
+  builder.AddMetadataUint32("qwen35moe.expert_shared_feed_forward_length",
+                            1024);
+  builder.AddMetadataUint32("qwen35moe.ssm.conv_kernel", 4);
+  builder.AddMetadataUint32("qwen35moe.ssm.state_size", 128);
+  builder.AddMetadataUint32("qwen35moe.ssm.group_count", 16);
+  builder.AddMetadataUint32("qwen35moe.ssm.time_step_rank", 64);
+  builder.AddMetadataUint32("qwen35moe.ssm.inner_size", 8192);
+  builder.AddMetadataUint32("qwen35moe.rope.dimension_count", 64);
+  builder.AddMetadataFloat32("qwen35moe.rope.freq_base", 10000000.0F);
+  builder.AddTensor("token_embd.weight", {3072, 8}, gufo::core::GgmlType::kBF16,
+                    0);
+
+  auto binary = builder.Build(512);
+  std::string err;
+  auto reader =
+      gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+  Expect(reader != nullptr, "MoE reader open succeeds: " + err);
+
+  auto config = reader->ExtractModelConfig(&err);
+  Expect(config.has_value(), "MoE ExtractModelConfig succeeds: " + err);
+  Expect(config->IsMoe(), "MoE config reports experts");
+  Expect(config->expert_count == 256, "256 experts");
+  Expect(config->expert_used_count == 8, "top-8 routing");
+  Expect(config->intermediate_size == 1024,
+         "FFN width falls back to the per-expert width");
+  Expect(config->num_layers == 48, "MTP block excluded from the trunk layers");
+  Expect(config->IsValidQwen(), "MoE config passes structural validation");
+}
+
 void TestQwen38_27BParsing() {
   GgufBuilder builder;
   builder.AddMetadataString("general.architecture", "qwen35");
@@ -368,6 +413,42 @@ void TestSplitGgufDiscovery() {
          "Split reader exposes two mapped regions");
   Expect(reader->GetData() == nullptr,
          "Split reader has no single contiguous backing pointer");
+
+  std::filesystem::remove_all(temp_dir);
+}
+
+void TestSplitGgufMetadataOnlyShard() {
+  // llama.cpp writers can emit a first shard that carries only metadata and no
+  // tensors; that shard has no aligned data payload at all.
+  const auto temp_dir =
+      std::filesystem::temp_directory_path() /
+      ("gufo-gguf-reader-moe-" + std::to_string(static_cast<long>(getpid())));
+  std::filesystem::create_directories(temp_dir);
+  const auto first_path = temp_dir / "model-00001-of-00002.gguf";
+  const auto second_path = temp_dir / "model-00002-of-00002.gguf";
+
+  GgufBuilder first;
+  first.AddMetadataString("general.architecture", "qwen35moe");
+  first.AddMetadataUint32("split.no", 0);
+  first.AddMetadataUint32("split.count", 2);
+  first.AddMetadataInt32("split.tensors.count", 1);
+
+  GgufBuilder second;
+  second.AddMetadataUint32("split.no", 1);
+  second.AddMetadataUint32("split.count", 2);
+  second.AddMetadataInt32("split.tensors.count", 1);
+  second.AddTensor("output_norm.weight", {4}, gufo::core::GgmlType::kF32, 0);
+
+  WriteBinaryFile(first_path, first.Build(128));
+  WriteBinaryFile(second_path, second.Build(128));
+
+  std::string err;
+  const auto reader = gufo::core::GgufReader::OpenFile(first_path, &err);
+  Expect(reader != nullptr, "Metadata-only split shard opens: " + err);
+  Expect(reader->GetTensorCount() == 1,
+         "Metadata-only shard contributes no tensors");
+  Expect(reader->FindTensor("output_norm.weight") != nullptr,
+         "Tensor from the payload shard is found");
 
   std::filesystem::remove_all(temp_dir);
 }
@@ -672,8 +753,10 @@ int main() {
   TestNarrowIntegerArrays();
   std::cout << "Running GgufReader unit tests...\n";
   TestBasicGgufParsing();
+  TestQwen35MoeConfig();
   TestQwen38_27BParsing();
   TestSplitGgufDiscovery();
+  TestSplitGgufMetadataOnlyShard();
   TestVisionExclusionValidation();
   TestQuantizationLabel();
   TestMalformedGgufRejection();

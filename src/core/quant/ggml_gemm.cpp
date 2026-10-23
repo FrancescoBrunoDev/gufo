@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "src/core/quant/ggml_dequant.hpp"
 
@@ -75,6 +76,15 @@ void Dequantize(core::GgmlType type, const void* src, float* dst,
     case core::GgmlType::kQ8_0:
       DequantizeQ8_0(src, dst, k);
       return;
+    case core::GgmlType::kIQ4_XS:
+      DequantizeIQ4_XS(src, dst, k);
+      return;
+    case core::GgmlType::kIQ4_NL:
+      DequantizeIQ4_NL(src, dst, k);
+      return;
+    case core::GgmlType::kIQ3_S:
+      DequantizeIQ3_S(src, dst, k);
+      return;
     default:
       assert(false && "quant::Dequantize: unsupported GgmlType");
       std::abort();
@@ -120,6 +130,22 @@ float Dot(core::GgmlType type, const void* row, std::span<const float> x,
       return DotProductQ8_K(row, x, k);
     case core::GgmlType::kQ8_0:
       return DotProductQ8_0(row, x, k);
+    case core::GgmlType::kIQ4_XS:
+    case core::GgmlType::kIQ4_NL:
+    case core::GgmlType::kIQ3_S: {
+      // The codebook formats have a parity-tested dequantizer but no integer
+      // kernel. The CPU path is a numerical reference, so decode the row and
+      // dot it in float; the thread-local buffer keeps the loop
+      // allocation-free.
+      static thread_local std::vector<float> decoded;
+      decoded.resize(k);
+      Dequantize(type, row, decoded.data(), k);
+      float sum = 0.0F;
+      for (std::size_t i = 0; i < k; ++i) {
+        sum += decoded[i] * x[i];
+      }
+      return sum;
+    }
     default:
       assert(false && "quant::Dot: unsupported GgmlType");
       std::abort();

@@ -64,7 +64,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
   const QwenGraphRejection graph_rejections = ResolveQwenGraphRejections(
       compute_logits, use_split_k_decode,
       graph_executor_.IsEnabled() &&
-          pos >= vision_input_.layout().PrefixLength());
+          pos >= vision_input_.layout().PrefixLength(),
+      weights_.config.IsMoe());
   detail::EmitQwenGraphEligibility(
       graph_key.execution_identity, graph_key.workload_identity,
       static_cast<std::uint32_t>(graph_rejections));

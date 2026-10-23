@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "src/models/qwen/moe.hpp"
 #include "src/models/qwen/state.hpp"
 
 namespace gufo::models {
@@ -136,6 +137,78 @@ bool ValidateTensor(const QwenTensorRef& tensor, std::size_t expected_elements,
   return true;
 }
 
+/// Validates the mixture-of-experts FFN of one layer: the router, the packed
+/// 3D expert tensors (one contiguous, block-aligned slice per expert) and the
+/// separately gated shared expert.
+bool ValidateMoeFfn(const QwenLayerWeights& layer,
+                    const core::ModelConfig& config, std::size_t hidden_size,
+                    const std::string& prefix, std::string* error_msg) {
+  if (config.expert_used_count > qwen::kMaxSelectedExperts ||
+      config.expert_used_count == 0) {
+    if (error_msg != nullptr) {
+      *error_msg = "Routed expert count is outside the supported range: " +
+                   std::to_string(config.expert_used_count);
+    }
+    return false;
+  }
+  const std::size_t experts = config.expert_count;
+  const std::size_t expert_ffn = config.expert_feed_forward_length;
+  const std::size_t shared_ffn = config.shared_expert_feed_forward_length != 0
+                                     ? config.shared_expert_feed_forward_length
+                                     : expert_ffn;
+  if (!ValidateTensor(layer.ffn_gate_inp, experts * hidden_size,
+                      TensorRole::kProjection, prefix + "ffn_gate_inp.weight",
+                      error_msg, hidden_size) ||
+      !ValidateTensor(layer.ffn_gate_exps, experts * expert_ffn * hidden_size,
+                      TensorRole::kProjection, prefix + "ffn_gate_exps.weight",
+                      error_msg, expert_ffn) ||
+      !ValidateTensor(layer.ffn_up_exps, experts * expert_ffn * hidden_size,
+                      TensorRole::kProjection, prefix + "ffn_up_exps.weight",
+                      error_msg, expert_ffn) ||
+      !ValidateTensor(layer.ffn_down_exps, experts * expert_ffn * hidden_size,
+                      TensorRole::kProjection, prefix + "ffn_down_exps.weight",
+                      error_msg, hidden_size) ||
+      !ValidateTensor(layer.ffn_gate_inp_shexp, hidden_size,
+                      TensorRole::kProjection,
+                      prefix + "ffn_gate_inp_shexp.weight", error_msg) ||
+      !ValidateTensor(layer.ffn_gate_shexp, hidden_size * shared_ffn,
+                      TensorRole::kProjection, prefix + "ffn_gate_shexp.weight",
+                      error_msg, hidden_size) ||
+      !ValidateTensor(layer.ffn_up_shexp, hidden_size * shared_ffn,
+                      TensorRole::kProjection, prefix + "ffn_up_shexp.weight",
+                      error_msg, hidden_size) ||
+      !ValidateTensor(layer.ffn_down_shexp, hidden_size * shared_ffn,
+                      TensorRole::kProjection, prefix + "ffn_down_shexp.weight",
+                      error_msg, shared_ffn)) {
+    return false;
+  }
+  // Experts are addressed by byte offset, so every packed slice must hold a
+  // whole number of quant blocks. The width checks above already pin the
+  // element counts; this rejects formats whose rows are not block aligned.
+  for (const auto* exps : {&layer.ffn_gate_exps, &layer.ffn_up_exps}) {
+    if (!exps->Slice(expert_ffn * hidden_size, expert_ffn * hidden_size)
+             .FitsAvailableStorage()) {
+      if (error_msg != nullptr) {
+        *error_msg =
+            "Packed expert tensor has misaligned expert slices: " + prefix +
+            "ffn_*_exps.weight";
+      }
+      return false;
+    }
+  }
+  if (!layer.ffn_down_exps
+           .Slice(hidden_size * expert_ffn, hidden_size * expert_ffn)
+           .FitsAvailableStorage()) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          "Packed expert tensor has misaligned expert slices: " + prefix +
+          "ffn_down_exps.weight";
+    }
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
@@ -247,6 +320,20 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
     l.ffn_up = ExtractTensorRef(reader, prefix + "ffn_up.weight");
     l.ffn_down = ExtractTensorRef(reader, prefix + "ffn_down.weight");
 
+    if (weights.config.IsMoe()) {
+      l.ffn_gate_inp = ExtractTensorRef(reader, prefix + "ffn_gate_inp.weight");
+      const auto ref = [&](std::string_view name) {
+        return ExtractTensorRef(reader, prefix + std::string(name));
+      };
+      l.ffn_gate_exps = ref("ffn_gate_exps.weight");
+      l.ffn_up_exps = ref("ffn_up_exps.weight");
+      l.ffn_down_exps = ref("ffn_down_exps.weight");
+      l.ffn_gate_inp_shexp = ref("ffn_gate_inp_shexp.weight");
+      l.ffn_gate_shexp = ref("ffn_gate_shexp.weight");
+      l.ffn_up_shexp = ref("ffn_up_shexp.weight");
+      l.ffn_down_shexp = ref("ffn_down_shexp.weight");
+    }
+
     const bool expected_full_attention =
         ((i + 1) % weights.config.full_attention_interval) == 0;
     if (l.is_full_attention != expected_full_attention) {
@@ -263,16 +350,25 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
     if (!ValidateTensor(l.attn_norm, hidden_size, TensorRole::kNorm,
                         prefix + "attn_norm.weight", error_msg) ||
         !ValidateTensor(l.ffn_norm, hidden_size, TensorRole::kNorm,
-                        prefix + "post_attention_norm.weight", error_msg) ||
-        !ValidateTensor(l.ffn_gate, intermediate_size * hidden_size,
-                        TensorRole::kProjection, prefix + "ffn_gate.weight",
-                        error_msg, hidden_size) ||
-        !ValidateTensor(l.ffn_up, intermediate_size * hidden_size,
-                        TensorRole::kProjection, prefix + "ffn_up.weight",
-                        error_msg, hidden_size) ||
-        !ValidateTensor(l.ffn_down, hidden_size * intermediate_size,
-                        TensorRole::kProjection, prefix + "ffn_down.weight",
-                        error_msg, intermediate_size)) {
+                        prefix + "post_attention_norm.weight", error_msg)) {
+      return std::nullopt;
+    }
+    if (weights.config.IsMoe()) {
+      if (!ValidateMoeFfn(l, weights.config, hidden_size, prefix, error_msg)) {
+        return std::nullopt;
+      }
+    } else if (!ValidateTensor(l.ffn_gate, intermediate_size * hidden_size,
+                               TensorRole::kProjection,
+                               prefix + "ffn_gate.weight", error_msg,
+                               hidden_size) ||
+               !ValidateTensor(l.ffn_up, intermediate_size * hidden_size,
+                               TensorRole::kProjection,
+                               prefix + "ffn_up.weight", error_msg,
+                               hidden_size) ||
+               !ValidateTensor(l.ffn_down, hidden_size * intermediate_size,
+                               TensorRole::kProjection,
+                               prefix + "ffn_down.weight", error_msg,
+                               intermediate_size)) {
       return std::nullopt;
     }
 

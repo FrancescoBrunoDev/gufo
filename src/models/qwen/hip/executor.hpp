@@ -222,6 +222,12 @@ struct QwenFfnScratch {
   std::span<float> up;
   std::span<float> activation;
   std::span<float> out;
+  // Mixture of experts: the router logits, the selected experts and their
+  // renormalized weights, and one expert's output. Unused by a dense FFN.
+  std::span<float> router_logits;
+  std::span<std::uint32_t> expert_ids;
+  std::span<float> expert_weights;
+  std::span<float> moe_out;
 };
 
 /// Typed non-owning capability views over stable Qwen GPU arena allocations.
@@ -300,6 +306,10 @@ public:
   float* d_ffn_up{nullptr};
   float* d_ffn_act{nullptr};
   float* d_ffn_out{nullptr};
+  /// Mixture-of-experts routing scratch: router logits, selected weights and
+  /// one expert's output share one allocation; the ids get their own.
+  float* d_moe_scratch{nullptr};
+  std::uint32_t* d_moe_expert_ids{nullptr};
   float* d_ssm_qkv{nullptr};
   float* d_conv_out{nullptr};
   float* d_ssm_gate{nullptr};

@@ -14,7 +14,9 @@ struct ModelConfig {
   std::string model_name{"qwen3.5-4b-text"};
   std::uint32_t num_layers{36};  ///< Main transformer layers, excluding MTP.
   std::uint32_t hidden_size{2560};
-  std::uint32_t intermediate_size{9728};  ///< 17408 for Qwen3.8-27B.
+  /// FFN width of one FFN GEMM: the dense FFN, or one expert for a mixture of
+  /// experts. 17408 for Qwen3.8-27B, 1024 for the 122B MoE.
+  std::uint32_t intermediate_size{9728};
   std::uint32_t num_attention_heads{16};
   std::uint32_t num_key_value_heads{4};
   std::uint32_t head_dim{256};
@@ -29,6 +31,11 @@ struct ModelConfig {
   std::uint32_t ssm_time_step_rank{32};
   std::uint32_t ssm_inner_size{4096};
   std::uint32_t rotary_dim{64};
+  /// Mixture of experts. `expert_count` is 0 for a dense FFN.
+  std::uint32_t expert_count{0};
+  std::uint32_t expert_used_count{0};
+  std::uint32_t expert_feed_forward_length{0};
+  std::uint32_t shared_expert_feed_forward_length{0};
   float rope_theta{10000000.0F};
   float rope_scale{1.0F};
   bool is_text_only{true};
@@ -63,6 +70,10 @@ struct ModelConfig {
     return (2 * ssm_group_count * ssm_state_size) + ssm_inner_size;
   }
 
+  [[nodiscard]] constexpr bool IsMoe() const noexcept {
+    return expert_count > 0;
+  }
+
   /// Returns true if this configuration conforms to the Qwen3.5/3.8 repeating
   /// block structure.
   [[nodiscard]] constexpr bool IsValidQwen() const noexcept {
@@ -75,7 +86,16 @@ struct ModelConfig {
            ssm_conv_kernel == 4 && ssm_state_size == 128 &&
            ssm_group_count > 0 && ssm_time_step_rank > 0 &&
            ssm_inner_size > 0 && (ssm_inner_size % ssm_time_step_rank) == 0 &&
-           SsmValueSize() == 128 && is_text_only;
+           SsmValueSize() == 128 && is_text_only &&
+           // A mixture of experts needs a routable subset of experts, and the
+           // shared expert must reuse the per-expert FFN width, which is the
+           // only width the FFN scratch buffers are sized for.
+           (expert_count == 0 ||
+            (expert_used_count > 0 && expert_used_count <= expert_count &&
+             expert_feed_forward_length > 0 &&
+             (shared_expert_feed_forward_length == 0 ||
+              shared_expert_feed_forward_length ==
+                  expert_feed_forward_length)));
   }
 };
 

@@ -7,6 +7,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/modules/modules.hpp"
+#include "src/models/qwen/moe.hpp"
 
 namespace gufo::hip {
 
@@ -223,8 +224,14 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       }
     }
 
-    // Fused SwiGLU FFN
-    {
+    // Fused SwiGLU FFN, or the mixture-of-experts FFN the artifact declares
+    if (config.IsMoe()) {
+      gufo::models::qwen::MoeFfnForward(
+          module_ctx, layer, config, decode_scratch.normed,
+          ffn_scratch.router_logits, ffn_scratch.expert_ids,
+          ffn_scratch.expert_weights, ffn_scratch.gate, ffn_scratch.up,
+          ffn_scratch.activation, ffn_scratch.moe_out, ffn_scratch.out);
+    } else {
       // Non-fused FFN, routed through the module. Same fused SwiGLU kernel +
       // same down GEMV as the former inline calls; behavior identical. The
       // module reads the arena device spans (x = d_normed, act_scratch =

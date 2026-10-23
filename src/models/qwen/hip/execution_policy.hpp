@@ -141,6 +141,9 @@ enum class QwenGraphRejection : std::uint32_t {
   kLogitsNotRequested = 1U << 0U,
   kSplitKAttentionRequired = 1U << 1U,
   kGraphDisabled = 1U << 3U,
+  /// Mixture-of-experts decode reads its routed expert ids back to the host, so
+  /// its launches cannot be replayed from a captured graph.
+  kMoeRoutingRead = 1U << 4U,
 };
 
 [[nodiscard]] constexpr QwenGraphRejection operator|(
@@ -162,10 +165,14 @@ constexpr QwenGraphRejection& operator|=(QwenGraphRejection& lhs,
 }
 
 [[nodiscard]] constexpr QwenGraphRejection ResolveQwenGraphRejections(
-    bool compute_logits, bool split_k_attention, bool graph_enabled) noexcept {
+    bool compute_logits, bool split_k_attention, bool graph_enabled,
+    bool moe_routing_read = false) noexcept {
   QwenGraphRejection rejected = QwenGraphRejection::kNone;
   if (!compute_logits) {
     rejected |= QwenGraphRejection::kLogitsNotRequested;
+  }
+  if (moe_routing_read) {
+    rejected |= QwenGraphRejection::kMoeRoutingRead;
   }
   if (split_k_attention) {
     rejected |= QwenGraphRejection::kSplitKAttentionRequired;

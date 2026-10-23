@@ -121,6 +121,24 @@ struct QwenTensorRef {
     }
     return {};
   }
+
+  /// Re-binds this reference to `count` elements (a whole number of quant
+  /// blocks) starting at element `begin`. Used to walk one expert of a packed
+  /// 3D expert tensor.
+  [[nodiscard]] QwenTensorRef Slice(std::size_t begin,
+                                    std::size_t count) const noexcept {
+    const std::size_t begin_bytes = gufo::quant::EncodedSizeBytes(type, begin);
+    const std::size_t slice_bytes = gufo::quant::EncodedSizeBytes(type, count);
+    if (data == nullptr || begin_bytes == 0 || slice_bytes == 0 ||
+        begin_bytes > available_bytes ||
+        slice_bytes > available_bytes - begin_bytes) {
+      return {};
+    }
+    return {.data = static_cast<const std::uint8_t*>(data) + begin_bytes,
+            .type = type,
+            .num_elements = count,
+            .available_bytes = available_bytes - begin_bytes};
+  }
 };
 
 /// Tensor weight references for a single transformer layer block (Linear SSM or
@@ -151,10 +169,22 @@ struct QwenLayerWeights {
   QwenTensorRef ssm_norm;
   QwenTensorRef ssm_out;
 
-  // Feed Forward Network
+  // Feed Forward Network. A dense layer fills `ffn_gate/up/down`; a mixture of
+  // experts fills `ffn_*_exps` (packed 3D, one contiguous expert slice per
+  // block) plus the shared expert and its scalar gate.
   QwenTensorRef ffn_gate;
   QwenTensorRef ffn_up;
   QwenTensorRef ffn_down;
+
+  // Mixture of experts: <arch>.expert_count > 0.
+  QwenTensorRef ffn_gate_inp;        ///< router, [hidden, expert_count]
+  QwenTensorRef ffn_gate_exps;       ///< [hidden, e_ffn, expert_count]
+  QwenTensorRef ffn_up_exps;         ///< [hidden, e_ffn, expert_count]
+  QwenTensorRef ffn_down_exps;       ///< [e_ffn, hidden, expert_count]
+  QwenTensorRef ffn_gate_inp_shexp;  ///< shared-expert scalar gate, [hidden]
+  QwenTensorRef ffn_gate_shexp;      ///< [hidden, shared_ffn]
+  QwenTensorRef ffn_up_shexp;        ///< [hidden, shared_ffn]
+  QwenTensorRef ffn_down_shexp;      ///< [shared_ffn, hidden]
 };
 
 /// Full model tensor references mapped directly from GGUF storage.
@@ -223,6 +253,10 @@ struct QwenScratchArena {
   std::span<float> mlp_up;
   std::span<float> mlp_act;
   std::span<float> mlp_out;
+  /// Router logits for mixture-of-experts layers (`expert_count` wide).
+  std::span<float> router_logits;
+  /// Per-expert output buffer for mixture-of-experts layers.
+  std::span<float> moe_out;
   std::span<float> ssm_qkv;
   std::span<float> ssm_gate;
   std::span<float> ssm_out_buf;

@@ -747,9 +747,11 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
     tensors_.push_back(std::move(info));
   }
 
-  // Align data payload base to alignment boundary
+  // Align data payload base to alignment boundary. A split shard that holds
+  // only metadata has no payload: llama.cpp leaves no padding after the tensor
+  // infos, so the file ends exactly at `offset`.
   const auto padding = (alignment_ - offset % alignment_) % alignment_;
-  if (offset > size_ || padding > size_ - offset)
+  if (offset > size_ || (!tensors_.empty() && padding > size_ - offset))
     return false;
   const std::size_t data_base = offset + padding;
   for (auto& tensor : tensors_) {
@@ -960,6 +962,24 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
   }
   if (auto val = GetMetadataUint32(prefix + "ssm.inner_size")) {
     config.ssm_inner_size = *val;
+  }
+  if (auto val = GetMetadataUint32(prefix + "expert_count")) {
+    config.expert_count = *val;
+  }
+  if (auto val = GetMetadataUint32(prefix + "expert_used_count")) {
+    config.expert_used_count = *val;
+  }
+  if (auto val = GetMetadataUint32(prefix + "expert_feed_forward_length")) {
+    config.expert_feed_forward_length = *val;
+  }
+  if (auto val =
+          GetMetadataUint32(prefix + "expert_shared_feed_forward_length")) {
+    config.shared_expert_feed_forward_length = *val;
+  }
+  // A MoE GGUF carries no <arch>.feed_forward_length, so the FFN width every
+  // GEMM and FFN scratch buffer needs is the width of one expert.
+  if (config.IsMoe() && !GetMetadataUint32(prefix + "feed_forward_length")) {
+    config.intermediate_size = config.expert_feed_forward_length;
   }
   if (auto val = GetMetadataFloat32(prefix + "rope.freq_base")) {
     config.rope_theta = *val;

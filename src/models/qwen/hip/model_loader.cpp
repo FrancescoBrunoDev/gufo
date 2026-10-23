@@ -207,6 +207,19 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
     return nullptr;
   }
 
+  if (weights_opt->config.IsMoe()) {
+    // The MoE kernels match the CPU reference on real weights, but this
+    // artifact's HIP output is still wrong end to end (the CPU path is
+    // correct), so some other HIP kernel disagrees at these dimensions. Refuse
+    // it instead of serving wrong tokens; see docs/models/qwen35moe/README.md.
+    if (error_msg != nullptr) {
+      *error_msg =
+          "qwen35moe artifacts are not numerically verified on the HIP backend "
+          "yet; run with --cpu for the verified reference path";
+    }
+    return nullptr;
+  }
+
   auto tokenizer =
       tokenization::QwenTokenizer::CreateFromGguf(*reader, error_msg);
   if (!tokenizer)
@@ -232,7 +245,11 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
                remap(layer.ssm_beta) && remap(layer.ssm_a) &&
                remap(layer.ssm_dt) && remap(layer.ssm_norm) &&
                remap(layer.ffn_norm) && remap(layer.ffn_gate) &&
-               remap(layer.ffn_up) && remap(layer.ffn_down);
+               remap(layer.ffn_up) && remap(layer.ffn_down) &&
+               remap(layer.ffn_gate_inp) && remap(layer.ffn_gate_exps) &&
+               remap(layer.ffn_up_exps) && remap(layer.ffn_down_exps) &&
+               remap(layer.ffn_gate_inp_shexp) && remap(layer.ffn_gate_shexp) &&
+               remap(layer.ffn_up_shexp) && remap(layer.ffn_down_shexp);
   }
   if (!remapped) {
     ReleaseWeightRegions(weight_regions);

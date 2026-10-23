@@ -77,10 +77,10 @@ QwenScratchArena::QwenScratchArena(const core::ModelConfig& config) {
   const std::size_t ssm_gate_size =
       std::max<std::size_t>(config.ssm_inner_size, q_size);
 
-  const std::size_t total_size = (hidden_size * 4) + q_size + (kv_size * 2) +
-                                 max_context + (intermediate_size * 3) +
-                                 ssm_qkv_size + ssm_gate_size +
-                                 config.ssm_inner_size + vocab_size;
+  const std::size_t total_size =
+      (hidden_size * 4) + q_size + (kv_size * 2) + max_context +
+      (intermediate_size * 3) + ssm_qkv_size + ssm_gate_size +
+      config.ssm_inner_size + vocab_size + config.expert_count + hidden_size;
   buffer.resize(total_size, 0.0F);
 
   std::size_t cur = 0;
@@ -105,6 +105,8 @@ QwenScratchArena::QwenScratchArena(const core::ModelConfig& config) {
   ssm_gate = alloc_span(ssm_gate_size);
   ssm_out_buf = alloc_span(config.ssm_inner_size);
   logits = alloc_span(vocab_size);
+  router_logits = alloc_span(config.expert_count);
+  moe_out = alloc_span(hidden_size);
 }
 
 }  // namespace gufo::models

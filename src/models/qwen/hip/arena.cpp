@@ -14,6 +14,7 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
+#include "src/models/qwen/moe.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -741,6 +742,17 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
     HIP_CHECK(hipMalloc(&d_ffn_up, batch * intermediate_size * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_ffn_act, batch * intermediate_size * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_ffn_out, batch * hidden_size * sizeof(float)));
+    // One allocation for the router logits, the selected weights and one
+    // expert's output; the ids are uint32 so they get their own.
+    // Per row: the router logits, the selected weights and the output; the
+    // selected ids are uint32 so they get their own allocation.
+    const std::size_t moe_routed_floats =
+        batch * (config_.expert_count + models::qwen::kMaxSelectedExperts +
+                 hidden_size);
+    HIP_CHECK(hipMalloc(&d_moe_scratch, moe_routed_floats * sizeof(float)));
+    HIP_CHECK(hipMalloc(
+        &d_moe_expert_ids,
+        batch * models::qwen::kMaxSelectedExperts * sizeof(std::uint32_t)));
     HIP_CHECK(hipMalloc(&d_ssm_qkv, batch * projection_width * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_conv_out, batch * ssm_qkv_size * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_ssm_gate, batch * recurrent_width * sizeof(float)));
@@ -883,6 +895,15 @@ QwenGpuScratchView QwenGpuArena::GetScratchView(
               .up = {d_ffn_up, batch * config_.intermediate_size},
               .activation = {d_ffn_act, batch * config_.intermediate_size},
               .out = {d_ffn_out, batch * hidden},
+              .router_logits = {d_moe_scratch, batch * config_.expert_count},
+              .expert_ids = {d_moe_expert_ids,
+                             batch * models::qwen::kMaxSelectedExperts},
+              .expert_weights = {d_moe_scratch + (batch * config_.expert_count),
+                                 batch * models::qwen::kMaxSelectedExperts},
+              .moe_out = {d_moe_scratch +
+                              (batch * (config_.expert_count +
+                                        models::qwen::kMaxSelectedExperts)),
+                          batch * hidden},
           },
   };
 }
@@ -926,6 +947,8 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_ffn_up = other.d_ffn_up;
   d_ffn_act = other.d_ffn_act;
   d_ffn_out = other.d_ffn_out;
+  d_moe_scratch = other.d_moe_scratch;
+  d_moe_expert_ids = other.d_moe_expert_ids;
   d_ssm_qkv = other.d_ssm_qkv;
   d_conv_out = other.d_conv_out;
   d_ssm_gate = other.d_ssm_gate;
@@ -973,6 +996,8 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.d_ffn_up = nullptr;
   other.d_ffn_act = nullptr;
   other.d_ffn_out = nullptr;
+  other.d_moe_scratch = nullptr;
+  other.d_moe_expert_ids = nullptr;
   other.d_ssm_qkv = nullptr;
   other.d_conv_out = nullptr;
   other.d_ssm_gate = nullptr;
@@ -1028,6 +1053,10 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     d_ffn_up = other.d_ffn_up;
     d_ffn_act = other.d_ffn_act;
     d_ffn_out = other.d_ffn_out;
+    d_moe_scratch = other.d_moe_scratch;
+    d_moe_expert_ids = other.d_moe_expert_ids;
+    d_moe_scratch = other.d_moe_scratch;
+    d_moe_expert_ids = other.d_moe_expert_ids;
     d_ssm_qkv = other.d_ssm_qkv;
     d_conv_out = other.d_conv_out;
     d_ssm_gate = other.d_ssm_gate;
@@ -1075,6 +1104,10 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     other.d_ffn_up = nullptr;
     other.d_ffn_act = nullptr;
     other.d_ffn_out = nullptr;
+    other.d_moe_scratch = nullptr;
+    other.d_moe_expert_ids = nullptr;
+    other.d_moe_scratch = nullptr;
+    other.d_moe_expert_ids = nullptr;
     other.d_ssm_qkv = nullptr;
     other.d_conv_out = nullptr;
     other.d_ssm_gate = nullptr;
@@ -1171,6 +1204,10 @@ void QwenGpuArena::FreeAll() noexcept {
     LogCleanupError(hipFree(d_ffn_act));
   if (d_ffn_out != nullptr)
     LogCleanupError(hipFree(d_ffn_out));
+  if (d_moe_scratch != nullptr)
+    LogCleanupError(hipFree(d_moe_scratch));
+  if (d_moe_expert_ids != nullptr)
+    LogCleanupError(hipFree(d_moe_expert_ids));
   if (d_ssm_qkv != nullptr)
     LogCleanupError(hipFree(d_ssm_qkv));
   if (d_conv_out != nullptr)
@@ -1237,6 +1274,8 @@ void QwenGpuArena::FreeAll() noexcept {
   d_ffn_up = nullptr;
   d_ffn_act = nullptr;
   d_ffn_out = nullptr;
+  d_moe_scratch = nullptr;
+  d_moe_expert_ids = nullptr;
   d_ssm_qkv = nullptr;
   d_conv_out = nullptr;
   d_ssm_gate = nullptr;

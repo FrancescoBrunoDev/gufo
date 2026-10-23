@@ -32,6 +32,9 @@ add_qwen_cpu_test(qwen_generator_test
 add_qwen_cpu_test(qwen_ssm_test
   tests/models/qwen/cpu/ssm_test.cpp
   "cpu;models;qwen;ssm;reference")
+add_qwen_cpu_test(qwen_moe_test
+  tests/models/qwen/cpu/moe_test.cpp
+  "cpu;models;qwen;moe;reference")
 add_qwen_cpu_test(qwen_oracle_test
   tests/models/qwen/cpu/model_oracle_test.cpp
   "cpu;models;qwen;oracles")
@@ -70,6 +73,15 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_hip_device_gate_test
     tests/models/qwen/hip/device_gate_test.cpp
     "hip;qwen;test-support;device-gate")
+  add_qwen_hip_test(qwen_moe_gpu_test
+    tests/models/qwen/hip/moe_test.cpp
+    "hip;gpu;kernels;qwen;qwen-kernel-oracle;moe")
+  add_qwen_hip_test(qwen_layer_diff_probe_test
+    tests/models/qwen/hip/layer_diff_probe_test.cpp
+    "hip;gpu;qwen;moe;model;slow")
+  add_qwen_hip_test(qwen_moe_real_weights_test
+    tests/models/qwen/hip/moe_real_weights_test.cpp
+    "hip;gpu;qwen;moe;model")
   add_qwen_hip_test(qwen_prompt_hidden_buffer_test
     tests/models/qwen/hip/prompt_hidden_buffer_test.cpp
     "hip;gpu;qwen")

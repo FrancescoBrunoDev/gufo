@@ -12,6 +12,7 @@
 #include "src/models/qwen/hip/detail/decode_step.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/moe.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -359,11 +360,20 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                          scratch.decode.normed.data(), nullptr, batch_size,
                          hidden_size, 1e-6F, arena.stream);
 
-    LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
-                        hidden_size, arena.stream);
-    LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
-                     scratch.ffn.out.data(), batch_size, hidden_size,
-                     intermediate_size, arena.stream);
+    if (config.IsMoe()) {
+      gufo::models::qwen::MoeFfnForwardRows(
+          gufo::models::qwen::HipModuleContext(arena.stream), layer, config,
+          batch_size, scratch.decode.normed, scratch.ffn.router_logits,
+          scratch.ffn.expert_ids, scratch.ffn.expert_weights, scratch.ffn.gate,
+          scratch.ffn.up, scratch.ffn.activation, scratch.ffn.moe_out,
+          scratch.ffn.out);
+    } else {
+      LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
+                          hidden_size, arena.stream);
+      LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
+                       scratch.ffn.out.data(), batch_size, hidden_size,
+                       intermediate_size, arena.stream);
+    }
     LaunchBatchedResidualAdd(
         scratch.decode.hidden.data(), scratch.ffn.out.data(),
         scratch.decode.hidden.data(), batch_size, hidden_size, arena.stream);
@@ -746,11 +756,20 @@ QwenGpuExecutor::ForwardVerificationBatch(
                          scratch.decode.normed.data(), nullptr, batch_size,
                          hidden_size, 1e-6F, arena_.stream);
 
-    LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
-                        hidden_size, arena_.stream);
-    LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
-                     scratch.ffn.out.data(), batch_size, hidden_size,
-                     intermediate_size, arena_.stream);
+    if (config.IsMoe()) {
+      gufo::models::qwen::MoeFfnForwardRows(
+          gufo::models::qwen::HipModuleContext(arena_.stream), layer, config,
+          batch_size, scratch.decode.normed, scratch.ffn.router_logits,
+          scratch.ffn.expert_ids, scratch.ffn.expert_weights, scratch.ffn.gate,
+          scratch.ffn.up, scratch.ffn.activation, scratch.ffn.moe_out,
+          scratch.ffn.out);
+    } else {
+      LaunchFfnActivation(layer, scratch, batch_size, intermediate_size,
+                          hidden_size, arena_.stream);
+      LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
+                       scratch.ffn.out.data(), batch_size, hidden_size,
+                       intermediate_size, arena_.stream);
+    }
     LaunchBatchedResidualAdd(
         scratch.decode.hidden.data(), scratch.ffn.out.data(),
         scratch.decode.hidden.data(), batch_size, hidden_size, arena_.stream);
