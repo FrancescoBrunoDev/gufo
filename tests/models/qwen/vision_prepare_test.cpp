@@ -77,6 +77,15 @@ int main(int argc, char** argv) {
     }
     const auto width = static_cast<std::uint32_t>(
         reader->GetMetadataUint64("clip.vision.projection_dim").value_or(0));
+    // A sidecar from another model must be rejected while opening, before any
+    // upload and before the prefill splice compares embedding rows.
+    bool rejected = false;
+    try {
+      (void)Encoder::Open({}, argv[1], width + 1024);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    Require(rejected, "a mismatched projector width was accepted");
     auto encoder = Encoder::Open({}, argv[1], width);
     Require(encoder != nullptr && encoder->ResidentBytes() == 0,
             "opening the sidecar uploaded weights");

@@ -21,6 +21,7 @@ using gufo::tokenization::kVisionEnd;
 using gufo::tokenization::kVisionStart;
 
 #if defined(ENGINE_ENABLE_HIP)
+#include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
 #endif
 
@@ -317,9 +318,9 @@ int main(int argc, char** argv) {
     }
     const bool preprocess =
         argc == 4 && std::string_view(argv[1]) == "--preprocess";
-    if (!preprocess && argc != 5)
+    if (!preprocess && argc != 4)
       throw std::invalid_argument(
-          "usage: qwen27b_vision_test MMPROJ IMAGE OUTPUT_DIR OUTPUT_WIDTH\n"
+          "usage: qwen27b_vision_test MMPROJ IMAGE OUTPUT_DIR\n"
           "       qwen27b_vision_test --preprocess IMAGE OUTPUT_DIR");
     const auto image = ResizeImage(
         gufo::core::DecodeImage(gufo::core::ReadImageFile(argv[2])));
@@ -335,7 +336,15 @@ int main(int argc, char** argv) {
     if (preprocess)
       return 0;
 #if defined(ENGINE_ENABLE_HIP)
-    Encoder encoder(argv[1], std::stoul(argv[4]));
+    std::string read_error;
+    const auto sidecar = gufo::core::GgufReader::OpenFile(argv[1], &read_error);
+    if (sidecar == nullptr)
+      throw std::invalid_argument(read_error);
+    // The sidecar's own projector width, so any supported mmproj qualifies
+    // without a caller-supplied constant.
+    const auto width = static_cast<std::uint32_t>(
+        sidecar->GetMetadataUint64("clip.vision.projection_dim").value_or(0));
+    Encoder encoder(argv[1], width);
     {
       std::ofstream identity(directory / "projector.sha256");
       identity << encoder.identity() << '\n';
@@ -349,6 +358,12 @@ int main(int argc, char** argv) {
           if (!output)
             throw std::runtime_error("cannot write vision comparison tensor");
         });
+    // One embedding row per merged patch, so the LM sees the number of
+    // placeholders the same grid produced, at the LM's own width.
+    const auto rows = image.height / (kPatchSize * kMergeSize) *
+                      (image.width / (kPatchSize * kMergeSize));
+    if (result->rows() != rows || result->width() != width)
+      throw std::runtime_error("vision embedding does not match its grid");
     std::cout << "encoded " << image.width << 'x' << image.height << " -> "
               << result->rows() << 'x' << result->width() << '\n';
     return 0;

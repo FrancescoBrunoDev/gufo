@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/core/quant/ggml_gemm.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
 
@@ -58,19 +59,9 @@ void ReadMatrixRow(const models::QwenTensorRef& tensor, std::size_t row,
   if (source == nullptr) {
     throw std::runtime_error("unsupported MTP matrix quantization");
   }
-  switch (tensor.type) {
-    case core::GgmlType::kQ3_K:
-      quant::DequantizeQ3_K(source, output, columns);
-      return;
-    case core::GgmlType::kQ4_K:
-      quant::DequantizeQ4_K(source, output, columns);
-      return;
-    case core::GgmlType::kQ6_K:
-      quant::DequantizeQ6_K(source, output, columns);
-      return;
-    default:
-      throw std::runtime_error("unsupported MTP matrix type");
-  }
+  // The CPU dequantizer covers exactly the formats DescribeQwenGemmFormat
+  // marks cpu_direct, which is what the MTP loader accepts.
+  quant::Dequantize(tensor.type, source, output, columns);
 }
 
 void CopyToDevice(void* destination, const void* source, std::size_t bytes) {
@@ -98,6 +89,28 @@ models::QwenTensorRef CopyVectorF32(const models::QwenTensorRef& source,
   return {
       .data = device,
       .type = core::GgmlType::kF32,
+      .num_elements = elements,
+  };
+}
+
+/// Copies a weight block verbatim, keeping its quantized format. The MTP expert
+/// tensors stay packed like the target loader leaves them: a BF16 expansion of
+/// the 122B nextn experts alone would add ~4.8 GiB of device memory and H2D.
+models::QwenTensorRef CopyMatrixQuantized(const models::QwenTensorRef& source,
+                                          std::size_t elements,
+                                          std::vector<void*>& allocations,
+                                          std::size_t& packed_bytes) {
+  const std::size_t bytes = quant::EncodedSizeBytes(source.type, elements);
+  if (bytes == 0) {
+    throw std::runtime_error("unsupported MTP packed tensor size");
+  }
+  void* device = detail::AllocateDevice(bytes);
+  allocations.push_back(device);
+  CopyToDevice(device, source.data, bytes);
+  packed_bytes += bytes;
+  return {
+      .data = device,
+      .type = source.type,
       .num_elements = elements,
   };
 }
@@ -182,12 +195,40 @@ void PackPrivateWeights(speculative::QwenMtpWeights& weights,
                                     allocations, packed_bytes);
   layer.ffn_norm =
       CopyVectorF32(layer.ffn_norm, hidden, allocations, packed_bytes);
-  layer.ffn_gate = PackMatrixBf16(layer.ffn_gate, intermediate, hidden,
+  if (weights.config.IsMoe()) {
+    const std::size_t experts = weights.config.expert_count;
+    const std::size_t expert_ffn = weights.config.expert_feed_forward_length;
+    const std::size_t shared_ffn =
+        weights.config.shared_expert_feed_forward_length != 0
+            ? weights.config.shared_expert_feed_forward_length
+            : expert_ffn;
+    layer.ffn_gate_inp = CopyMatrixQuantized(
+        layer.ffn_gate_inp, experts * hidden, allocations, packed_bytes);
+    layer.ffn_gate_exps =
+        CopyMatrixQuantized(layer.ffn_gate_exps, experts * expert_ffn * hidden,
+                            allocations, packed_bytes);
+    layer.ffn_up_exps =
+        CopyMatrixQuantized(layer.ffn_up_exps, experts * expert_ffn * hidden,
+                            allocations, packed_bytes);
+    layer.ffn_down_exps =
+        CopyMatrixQuantized(layer.ffn_down_exps, experts * expert_ffn * hidden,
+                            allocations, packed_bytes);
+    layer.ffn_gate_inp_shexp = CopyMatrixQuantized(
+        layer.ffn_gate_inp_shexp, hidden, allocations, packed_bytes);
+    layer.ffn_gate_shexp = CopyMatrixQuantized(
+        layer.ffn_gate_shexp, hidden * shared_ffn, allocations, packed_bytes);
+    layer.ffn_up_shexp = CopyMatrixQuantized(
+        layer.ffn_up_shexp, hidden * shared_ffn, allocations, packed_bytes);
+    layer.ffn_down_shexp = CopyMatrixQuantized(
+        layer.ffn_down_shexp, hidden * shared_ffn, allocations, packed_bytes);
+  } else {
+    layer.ffn_gate = PackMatrixBf16(layer.ffn_gate, intermediate, hidden,
+                                    allocations, packed_bytes);
+    layer.ffn_up = PackMatrixBf16(layer.ffn_up, intermediate, hidden,
                                   allocations, packed_bytes);
-  layer.ffn_up = PackMatrixBf16(layer.ffn_up, intermediate, hidden, allocations,
-                                packed_bytes);
-  layer.ffn_down = PackMatrixBf16(layer.ffn_down, hidden, intermediate,
-                                  allocations, packed_bytes);
+    layer.ffn_down = PackMatrixBf16(layer.ffn_down, hidden, intermediate,
+                                    allocations, packed_bytes);
+  }
 }
 
 }  // namespace

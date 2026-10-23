@@ -381,7 +381,16 @@ struct Encoder::Impl {
                                     std::string(key));
       }
     };
-    expect("clip.vision.projection_dim", width);
+    // The projector's output width is the owning model's embedding length, so
+    // a sidecar that disagrees belongs to another model and must fail here
+    // rather than in the prefill splice.
+    const auto projection_dim =
+        reader->GetMetadataUint64("clip.vision.projection_dim").value_or(0);
+    if (projection_dim != width) {
+      throw std::invalid_argument(
+          "vision sidecar projects to width " + std::to_string(projection_dim) +
+          ", model embedding length is " + std::to_string(width));
+    }
     expect("clip.vision.patch_size", 16);
     expect("clip.vision.embedding_length", kHidden);
     expect("clip.vision.feed_forward_length", kFfn);
@@ -389,15 +398,13 @@ struct Encoder::Impl {
     expect("clip.vision.attention.head_count", kHeads);
     expect("clip.vision.spatial_merge_size", 2);
     expect("clip.vision.image_size", 768);
-    if ((width != 5120 && width != 2560) ||
-        reader->GetMetadataString("general.architecture") != "clip" ||
+    if (reader->GetMetadataString("general.architecture") != "clip" ||
         reader->GetMetadataString("general.type") != "mmproj" ||
         reader->GetMetadataBool("clip.has_vision_encoder") != true ||
         reader->GetMetadataBool("clip.use_gelu") != true ||
         reader->GetMetadataFloat32(
             "clip.vision.attention.layer_norm_epsilon") != 1e-6F) {
-      throw std::invalid_argument(
-          "vision sidecar does not match the Qwen3.8 model");
+      throw std::invalid_argument("vision sidecar is not a Qwen3-VL mmproj");
     }
     for (const auto key : {"clip.vision.image_mean", "clip.vision.image_std"}) {
       const auto* value = reader->FindMetadata(key);

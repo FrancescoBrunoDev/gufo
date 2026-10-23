@@ -14,7 +14,8 @@ CPU reference path and the HIP path answer correctly.
 | HIP routing, weighted accumulate, gated shared expert | done, tested on gfx1151 |
 | HIP executor wiring (decode, batched decode, prefill) | done |
 | HIP end-to-end correctness for this artifact | done (stream-ordering fix) |
-| MTP (`nextn`) draft head, vision (`mmproj-BF16`) | **not implemented** |
+| MTP (`nextn`) draft head, CPU and HIP | done |
+| Vision (`mmproj-BF16`) | done |
 
 ## Artifact
 
@@ -124,6 +125,58 @@ Rules that made the search cheap, worth repeating:
   including the 64-row `ssm_alpha`/`ssm_beta`), which is what redirected the
   search to host/device ordering in the new code.
 
+## MTP draft head
+
+The draft machinery was already generic; four things in it assumed the dense
+27B, and each is now derived instead of hardcoded:
+
+- the draft block index was the literal `blk.64`, now `blk.<config.num_layers>`
+  (48 here, and still 64 for the 27B, which stays byte-identical);
+- the draft FFN was dense, so `mtp_reference.cpp` and `hip/mtp/executor.cpp` now
+  branch on `IsMoe()` and call `MoeFfnForward` with router/expert scratch;
+- `IsMatrixType` rejected this artifact's projection formats, so it now accepts
+  the same set the target loader binds (IQ4_XS, Q4_K, Q5_K, Q8_0, ...);
+- the HIP side repacked every MTP matrix to BF16. The expert tensors are copied
+  quantized instead: 2.78 GB packed, 2.26 GB of BF16 conversions avoided, 0.56 s
+  to pack.
+
+Measured on the artifact (one draft step, CPU versus HIP): hidden cosine
+0.998126, RMSE 0.139, max absolute error 0.570, selected logit error 0.348.
+The cosine sits below the dense 27B's 0.999 because a 256-expert router can flip
+one expert on a near tie; that does not weaken the feature, since the verifier
+accepts a draft only when it matches the target's own argmax
+(`speculative_verifier.cpp`). End to end with `--speculative mtp`:
+
+```
+[Speculative]: acceptance=0.368932 drafted=103 accepted=38 verification_steps=25
+Generated 64 tokens on GPU in 5.01578s (12.7597 tok/s)
+```
+
+The greedy 64-token completion is **token-for-token identical** with and without
+MTP, which is the property that matters.
+
+## Vision
+
+The sidecar is geometrically the 27B's ViT: 27 blocks, `image_size 768`,
+`patch_size 16`, `embedding_length 1152`, `ffn 4304`, 16 heads, merge 2,
+`qwen3vl_merger`, no deepstack. Only the projection width differs (5120 -> 3072),
+so no kernel changed. Three gates hardwired that width and now derive it from the
+GGUF:
+
+| site | before | after |
+| --- | --- | --- |
+| `vision/encoder.hip` | `width` allowlist `5120`/`2560` | `clip.vision.projection_dim` must equal the model width, cross-checked against `mm.2.weight` |
+| `serve/inference_backend.cpp` | `if (embedding_length == 5120)` | width from `<architecture>.embedding_length` |
+| `cli/prompt/prompt.cpp` | same | same |
+
+A mismatched sidecar is now refused while opening, before any upload, instead of
+failing in the prefill splice. Encoder evidence on the real mmproj: 256x256 ->
+`64x3072` rows (8x8 placeholders), 371x193 resized to 384x192 -> `72x3072`,
+projector identity `sha256 a5ff1592...`, and `<|image_pad|>` 248056 matches
+`kImageToken` for this vocabulary. End to end on the artifact, a red circle with
+a blue square answers "a large red circle, and inside it a smaller blue square,
+centered".
+
 ## Remaining work
 
 1. **HIP MoE prefill**: expert bucketing plus a grouped GEMM; the dense prefill
@@ -133,4 +186,7 @@ Rules that made the search cheap, worth repeating:
    anonymous memory before `hipHostRegister`. The source pages are dropped as
    they are copied, so residency is about 74 GiB rather than 2×; reuse
    `src/core/hip/committed_backing` (the DeepSeek path) only to skip that copy.
-4. **MTP** and **vision**, once the dense backbone runs.
+4. **Vision numeric reference**: `tools/qwen27b/vision_reference.py` still
+   allowlists projector widths 2560/5120, so the ViT/merger values at 3072 are
+   not compared against a HF reference; the equivalence rests on geometric
+   identity and the row/width/identity checks above.

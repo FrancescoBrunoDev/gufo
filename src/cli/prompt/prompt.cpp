@@ -621,12 +621,18 @@ std::shared_ptr<models::qwen::vision::Encoder> LoadQwenVision(
     const PromptOptions& opt, const core::GgufReader& reader) {
   if (opt.image_paths.empty() && opt.vision_model_path.empty())
     return {};
-  if (reader.GetMetadataUint64("qwen35.embedding_length") != 5120) {
+  // The projector's output width is this model's embedding length, so the
+  // sidecar rejects a mismatched --mmproj before any weight upload.
+  const auto architecture =
+      reader.GetMetadataString("general.architecture").value_or("");
+  const auto width =
+      reader.GetMetadataUint32(std::string(architecture) + ".embedding_length")
+          .value_or(0);
+  if (width == 0)
     throw std::invalid_argument(
-        "image input supports Qwen3.8-27B and Flash-Next");
-  }
+        "image input requires a GGUF with an embedding length");
   auto encoder = models::qwen::vision::Encoder::Open(
-      opt.model_path, opt.vision_model_path, 5120);
+      opt.model_path, opt.vision_model_path, width);
   if (!encoder)
     throw std::invalid_argument(
         "image input requires a matching --mmproj BF16 sidecar");

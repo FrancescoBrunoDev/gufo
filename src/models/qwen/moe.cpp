@@ -4,6 +4,8 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -119,6 +121,12 @@ void MoeFfnForward(const QwenLayerWeights& layer,
   MoeSelection selection;
   MoeRoute(layer.ffn_gate_inp, x.first(hidden), config.expert_count,
            config.expert_used_count, router_logits, &selection);
+  if (std::getenv("GUFO_MOE_DEBUG") != nullptr) {
+    std::printf("DEBUG cpu route:");
+    for (std::uint32_t slot = 0; slot < selection.count; ++slot)
+      std::printf(" %u:%.6f", selection.experts[slot], selection.weights[slot]);
+    std::printf("\n");
+  }
 
   const std::span<const float> input = x.first(hidden);
   for (std::uint32_t slot = 0; slot < selection.count; ++slot) {
@@ -285,6 +293,15 @@ void MoeFfnForwardRows(
     return;
   }
 
+  if (std::getenv("GUFO_MOE_DEBUG") != nullptr) {
+    for (std::size_t row = 0; row < rows; ++row) {
+      std::printf("DEBUG hip route:");
+      for (std::size_t slot = 0; slot < selected_per_row; ++slot)
+        std::printf(" %u:%.6f", host_ids[row * kMaxSelectedExperts + slot],
+                    expert_weights[row * kMaxSelectedExperts + slot]);
+      std::printf("\n");
+    }
+  }
   const bool has_shared_expert = !layer.ffn_gate_shexp.empty();
   for (std::size_t row = 0; row < rows; ++row) {
     const auto selected = std::span<const std::uint32_t>(

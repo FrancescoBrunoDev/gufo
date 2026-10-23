@@ -3195,12 +3195,18 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
-    if (reader->GetMetadataUint64("qwen35.embedding_length") == 5120) {
-      vision = models::qwen::vision::Encoder::Open(model_path,
-                                                   vision_model_path, 5120);
+    // The projector's output width is this model's embedding length, so the
+    // sidecar rejects a mismatched --mmproj before any weight upload.
+    const auto vision_width =
+        reader
+            ->GetMetadataUint32(std::string(architecture) + ".embedding_length")
+            .value_or(0);
+    if (vision_width != 0) {
+      vision = models::qwen::vision::Encoder::Open(
+          model_path, vision_model_path, vision_width);
     } else if (!vision_model_path.empty()) {
       throw std::invalid_argument(
-          "image input supports Qwen3.8-27B and Flash-Next");
+          "image input requires a GGUF with an embedding length");
     }
   } catch (const std::exception& e) {
     SetError(error, e.what());

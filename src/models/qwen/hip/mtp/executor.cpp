@@ -11,6 +11,8 @@
 #include "src/models/qwen/hip/mtp.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/modules/module_ctx.hpp"
+#include "src/models/qwen/moe.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -104,6 +106,15 @@ void QwenMtpGpuExecutor::Allocate() {
                  detail::DecodeAttentionScratchElements(
                      config.num_attention_heads, config.head_dim));
   AllocateBuffer(d_out_token_, 1);
+  if (config.IsMoe()) {
+    AllocateBuffer(d_moe_router_logits_, config.expert_count);
+    AllocateBuffer(d_moe_expert_ids_, models::qwen::kMaxSelectedExperts);
+    AllocateBuffer(d_moe_expert_weights_, models::qwen::kMaxSelectedExperts);
+    AllocateBuffer(d_moe_gate_, intermediate);
+    AllocateBuffer(d_moe_up_, intermediate);
+    AllocateBuffer(d_moe_act_, intermediate);
+    AllocateBuffer(d_moe_expert_out_, hidden);
+  }
 }
 
 void QwenMtpGpuExecutor::Free() noexcept {
@@ -133,6 +144,13 @@ void QwenMtpGpuExecutor::Free() noexcept {
   free_buffer(d_kv_cache_f16_);
   free_buffer(d_split_k_scratch_);
   free_buffer(d_out_token_);
+  free_buffer(d_moe_router_logits_);
+  free_buffer(d_moe_expert_ids_);
+  free_buffer(d_moe_expert_weights_);
+  free_buffer(d_moe_gate_);
+  free_buffer(d_moe_up_);
+  free_buffer(d_moe_act_);
+  free_buffer(d_moe_expert_out_);
   if (stream_ != nullptr) {
     (void)hipStreamDestroy(stream_);
     stream_ = nullptr;
@@ -243,12 +261,29 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
 
   LaunchRMSNorm(d_hidden_, static_cast<const float*>(layer.ffn_norm.data),
                 d_normed_, hidden, 1.0e-6F, stream_);
-  LaunchFusedSwiGLUGEMV(layer.ffn_gate.data, layer.ffn_gate.type,
-                        layer.ffn_up.data, layer.ffn_up.type, d_normed_,
-                        d_ffn_act_, config.intermediate_size, hidden, stream_);
-  LaunchGEMV(layer.ffn_down.data, layer.ffn_down.type, d_ffn_act_, d_ffn_out_,
-             hidden, config.intermediate_size, stream_,
-             models::qwen::QwenGemmMode::kHipMtp);
+  if (config.IsMoe()) {
+    models::qwen::MoeFfnForward(
+        models::qwen::HipModuleContext(stream_), layer, config,
+        std::span<const float>(d_normed_, hidden),
+        std::span<float>(d_moe_router_logits_, config.expert_count),
+        std::span<std::uint32_t>(d_moe_expert_ids_,
+                                 models::qwen::kMaxSelectedExperts),
+        std::span<float>(d_moe_expert_weights_,
+                         models::qwen::kMaxSelectedExperts),
+        std::span<float>(d_moe_gate_, config.intermediate_size),
+        std::span<float>(d_moe_up_, config.intermediate_size),
+        std::span<float>(d_moe_act_, config.intermediate_size),
+        std::span<float>(d_moe_expert_out_, hidden),
+        std::span<float>(d_ffn_out_, hidden));
+  } else {
+    LaunchFusedSwiGLUGEMV(layer.ffn_gate.data, layer.ffn_gate.type,
+                          layer.ffn_up.data, layer.ffn_up.type, d_normed_,
+                          d_ffn_act_, config.intermediate_size, hidden,
+                          stream_);
+    LaunchGEMV(layer.ffn_down.data, layer.ffn_down.type, d_ffn_act_, d_ffn_out_,
+               hidden, config.intermediate_size, stream_,
+               models::qwen::QwenGemmMode::kHipMtp);
+  }
   LaunchResidualAdd(d_hidden_, d_ffn_out_, d_hidden_, hidden, stream_);
   LaunchRMSNorm(d_hidden_,
                 static_cast<const float*>(weights.shared_head_norm.data),

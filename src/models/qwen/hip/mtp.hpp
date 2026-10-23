@@ -137,6 +137,15 @@ private:
   float* d_attn_out_{nullptr};
   float* d_ffn_act_{nullptr};
   float* d_ffn_out_{nullptr};
+  // Mixture-of-experts FFN scratch; allocated only when the artifact declares
+  // experts.
+  float* d_moe_router_logits_{nullptr};
+  std::uint32_t* d_moe_expert_ids_{nullptr};
+  float* d_moe_expert_weights_{nullptr};
+  float* d_moe_gate_{nullptr};
+  float* d_moe_up_{nullptr};
+  float* d_moe_act_{nullptr};
+  float* d_moe_expert_out_{nullptr};
   float* d_feedback_hidden_{nullptr};
   float* d_logits_{nullptr};
   float* d_kv_cache_{nullptr};
