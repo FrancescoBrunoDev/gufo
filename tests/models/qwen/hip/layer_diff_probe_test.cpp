@@ -55,8 +55,27 @@ void WriteDump(const std::string& path, const std::vector<float>& values) {
 
 /// CPU reference: one token at a time, capturing the last token's hidden state
 /// after every layer.
+/// Overwrites the reservoir with the first `hidden` floats of `path`, which is
+/// a layer dump in the same format this probe writes. Used to feed one engine's
+/// layer output into the other so the next layer can be compared in isolation.
+bool InjectHidden(const std::string& path, std::span<float> hidden_state) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    return false;
+  }
+  std::uint64_t count = 0;
+  in.read(reinterpret_cast<char*>(&count), sizeof(count));
+  if (!in || count < hidden_state.size()) {
+    return false;
+  }
+  in.read(reinterpret_cast<char*>(hidden_state.data()),
+          static_cast<std::streamsize>(hidden_state.size() * sizeof(float)));
+  return static_cast<bool>(in);
+}
+
 int RunCpu(const std::string& model_path, const std::string& out_path,
-           std::span<const std::uint32_t> taps, std::size_t token_count) {
+           std::span<const std::uint32_t> taps, std::size_t token_count,
+           const std::string& inject_path) {
   std::string err;
   auto reader = gufo::core::GgufReader::OpenFile(model_path, &err);
   if (reader == nullptr) {
@@ -104,6 +123,12 @@ int RunCpu(const std::string& model_path, const std::string& out_path,
           if (taps[tap] == layer) {
             std::memcpy(layers.data() + (tap * hidden), arena.hidden.data(),
                         hidden * sizeof(float));
+          }
+        }
+        if (layer == 0 && !inject_path.empty()) {
+          if (!InjectHidden(inject_path, arena.hidden)) {
+            std::cerr << "cannot inject " << inject_path << "\n";
+            return 2;
           }
         }
       }
@@ -191,7 +216,8 @@ int main(int argc, char** argv) {
       argc > 4 ? static_cast<std::uint32_t>(std::stoul(argv[4])) : 4096U;
   try {
     if (mode == "cpu") {
-      return RunCpu(argv[1], argv[3], taps, token_count);
+      return RunCpu(argv[1], argv[3], taps, token_count,
+                    argc > 7 ? argv[7] : "");
     }
     if (mode == "gpu" || mode == "gputok") {
       return RunGpu(argv[1], argv[3], mode, context, taps, token_count);

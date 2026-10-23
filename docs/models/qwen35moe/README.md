@@ -1,8 +1,7 @@
 # Ornith 1.5 122B (`qwen35moe`)
 
-Hybrid SSM + Mixture-of-Experts Qwen3.5-family model. Gufo loads it and the CPU
-reference path answers correctly; the HIP path still emits wrong tokens, so the
-artifact is refused there until that is fixed.
+Hybrid SSM + Mixture-of-Experts Qwen3.5-family model. Gufo loads it and both the
+CPU reference path and the HIP path answer correctly.
 
 ## Status
 
@@ -14,12 +13,8 @@ artifact is refused there until that is fixed.
 | CPU reference FFN (`moe.cpp`) + numerical test | done |
 | HIP routing, weighted accumulate, gated shared expert | done, tested on gfx1151 |
 | HIP executor wiring (decode, batched decode, prefill) | done |
-| HIP end-to-end correctness for this artifact | **broken, see below** |
+| HIP end-to-end correctness for this artifact | done (stream-ordering fix) |
 | MTP (`nextn`) draft head, vision (`mmproj-BF16`) | **not implemented** |
-
-`hip::QwenGpuModel::CreateFromGguf` still refuses an MoE artifact, now because of
-the unresolved numeric disagreement described under "Open bug" rather than a
-missing FFN.
 
 ## Artifact
 
@@ -79,52 +74,59 @@ Sources: llama.cpp `qwen35moe.cpp` (`build_layer_ffn`) and the reference
   reference on the artifact's own experts, layer by layer (see below).
 - Hosted CPU suite 125/125 and the gfx1151 `gpu-fast` subset 59/59 stay green.
 
-## Open bug: HIP output is wrong for this artifact
+## Resolved bug: the HIP moe routing read was not stream ordered
 
-Measured, in order:
+The HIP run first answered `1000.00` instead of ` Rome.`, and the failure survived
+every fused kernel being switched off. The cause was in the new MoE path, not in
+the SSM or attention kernels:
 
-- `gufo prompt --cpu` on the artifact answers correctly (`The capital of Italy is`
-  → ` Rome.`), so the parser, config, weight binding, layer wiring, SSM,
-  attention and MoE math are all correct as written.
-- The same prompt on the HIP backend emits digits (`1000.00`). It also fails for
-  a one-token prompt, so the state is already wrong before steady-state decode.
-- The dense Qwen3.8-27B run on the same container and GPU still answers
-  correctly, so the engine and toolchain are sound.
-- `ctest -R qwen_moe_real_weights_test` compares the MoE FFN against the CPU
-  reference on the artifact's own weights, layer by layer: identical to 1e-7 for
-  IQ4_XS, Q4_K, Q5_K and Q8_0, with the same routed expert ids and weights.
-- Disabling the row-split recurrence, the fused SSM input projections, the
-  fused QK-norm/RoPE/KV write, and the fp16 KV cache each left the output wrong.
+`MoeFfnForwardRows` brought the routed expert ids back to the host with a
+blocking `hipMemcpy` on the default stream. The arena stream is created with
+`hipStreamNonBlocking` (`hip/arena.cpp`), so that copy was **not** ordered
+against `LaunchMoeRoute` on the arena stream: each layer read the ids that the
+*previous* layer had left in the buffer. Layer 0 came out right only because its
+queue was deep enough to finish the routing first, which is why the damage began
+exactly at layer 1 and then rode the residual stream. The same copy is on the
+decode path, so both prefill and steady-state decode were wrong.
 
-A layer-by-layer CPU-versus-HIP comparison is now available:
-`tests/models/qwen/hip/layer_diff_probe_test.cpp` dumps the last prompt token's
-hidden state after each layer from either engine. Calibrated on the dense 27B
-(CPU versus HIP stays at `cos ≈ 0.999997` for layers 0-3, so a dense model does
-not amplify reference noise):
+The fix is a `hipStreamSynchronize` before the copy. It does not add a dependency
+the shortcut in that comment did not already have; the real removal is to stop
+bringing expert selection to the host at all, which the comment records as the
+follow-up.
 
-| layer | 122B `cpu·hip` | 27B `cpu·hip` |
+Evidence, one token through `tests/models/qwen/hip/layer_diff_probe_test.cpp`
+(CPU versus HIP, last prompt token):
+
+| layer | before | after |
 | --- | --- | --- |
-| 0 | 0.999996 | 0.999997 |
-| 1 | 0.982247 | 0.999997 |
-| 2 | 0.989638 | 0.999998 |
-| 3 | 0.989154 | 0.999997 |
+| 0 | 0.99999595 | 0.99999595 |
+| 1 | 0.98224720 | 0.99999702 |
+| 2 | 0.98963810 | 0.99999815 |
+| 3 | 0.98915430 | 0.99999666 |
+| logits | -0.60555600 | 0.99992100 |
 
-Layer 0 is inside the dense-noise band and the divergence starts at layer 1,
-which is a second Gated DeltaNet layer running the same kernels as layer 0. The
-hip output magnitudes also run low (layer 3: 1.901 versus 2.161). Forcing
-`kv_cache_storage = kFp32` changes layer 1 by nothing, so this is not KV
-precision. Since the MoE FFN and its router are exact on layer 1's own weights,
-the remaining suspect is the SSM chain at
-`hidden=3072 / head_count_kv=2 / ssm.time_step_rank=64`, most likely its
-recurrent-state addressing for a second layer (layer 0 starts from zeroed state,
-so an aliased or mis-strided slot would only show from layer 1 onward).
-Enabling the SSM replay log and comparing the per-layer conv/DeltaNet state
-bytes between the two engines is the next check.
+Two identical HIP runs now produce bit-identical layer dumps, where the routed
+ids used to be a race. `gufo prompt --raw` on the artifact answers
+`The capital of Italy is` → ` Rome.` and continues `The capital of France is Paris.`
+
+Rules that made the search cheap, worth repeating:
+
+- Calibrate before believing a difference: the dense 27B holds `cos ≈ 0.999997`
+  between the engines, so a dense model does not amplify reference noise, and the
+  122B only started diverging at layer 1.
+- A cross-matrix of every CPU layer against every HIP layer rules out a
+  one-layer offset in the tap capture.
+- Feeding one engine's layer output into the other isolates a single layer: the
+  CPU reproduced its own layer-1 result from the HIP layer-0 state to within
+  2e-6, proving the HIP layer itself was wrong rather than an amplified input.
+- Independent audits of the SSM and prefill routes found no shape bug (the
+  quantized projections match the CPU reference to 1.8e-6 at every 122B shape,
+  including the 64-row `ssm_alpha`/`ssm_beta`), which is what redirected the
+  search to host/device ordering in the new code.
 
 ## Remaining work
 
-1. Fix the numeric disagreement above, then drop the `CreateFromGguf` guard.
-2. **HIP MoE prefill**: expert bucketing plus a grouped GEMM; the dense prefill
+1. **HIP MoE prefill**: expert bucketing plus a grouped GEMM; the dense prefill
    route table in `hip/kernels/prefill_quant_gemm.hip` is specialized for the
    27B shapes (5120/17408) and would fall back to generic paths here.
 3. **Weight residency**: `hip/model_loader.cpp` copies every GGUF region into

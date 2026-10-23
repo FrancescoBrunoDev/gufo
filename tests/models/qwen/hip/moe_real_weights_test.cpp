@@ -100,11 +100,10 @@ int main(int argc, char** argv) {
   std::vector<float> cpu_expert_out(hidden);
   std::vector<float> cpu_out(hidden, 0.0F);
   gufo::models::qwen::MoeFfnForward(
-      gufo::models::qwen::CpuModuleContext{}, host_layer, config,
-      std::span<const float>(x), std::span<float>(cpu_logits),
-      std::span<float>(cpu_gate), std::span<float>(cpu_up),
-      std::span<float>(cpu_act), std::span<float>(cpu_expert_out),
-      std::span<float>(cpu_out));
+      host_layer, config, std::span<const float>(x),
+      std::span<float>(cpu_logits), std::span<float>(cpu_gate),
+      std::span<float>(cpu_up), std::span<float>(cpu_act),
+      std::span<float>(cpu_expert_out), std::span<float>(cpu_out));
 
   // Upload the real quantized tensors and run the HIP path on the same input.
   auto upload = [&](const QwenTensorRef& ref) {

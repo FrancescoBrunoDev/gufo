@@ -35,7 +35,7 @@ void MoeRoute(const QwenTensorRef& router, std::span<const float> x,
 /// `router_logits` holds `expert_count` values, `gate_scratch`/`up_scratch`/
 /// `act_scratch` hold one expert's intermediate width and `expert_out` holds
 /// `hidden_size` values. `out` is overwritten.
-void MoeFfnForward(const CpuModuleContext& ctx, const QwenLayerWeights& layer,
+void MoeFfnForward(const QwenLayerWeights& layer,
                    const core::ModelConfig& config, std::span<const float> x,
                    std::span<float> router_logits,
                    std::span<float> gate_scratch, std::span<float> up_scratch,

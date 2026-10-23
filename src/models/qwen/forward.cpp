@@ -294,7 +294,7 @@ void ForwardLayer(std::span<float> hidden, const QwenLayerWeights& layer,
 
   // 5. SwiGLU FFN, or the mixture-of-experts FFN when the GGUF declares experts
   if (config.IsMoe()) {
-    qwen::MoeFfnForward(ctx, layer, config, arena.normed, arena.router_logits,
+    qwen::MoeFfnForward(layer, config, arena.normed, arena.router_logits,
                         arena.mlp_gate, arena.mlp_up, arena.mlp_act,
                         arena.moe_out, arena.mlp_out);
   } else {

@@ -95,7 +95,7 @@ void MoeRoute(const QwenTensorRef& router, std::span<const float> x,
   selection->count = selected;
 }
 
-void MoeFfnForward(const CpuModuleContext& ctx, const QwenLayerWeights& layer,
+void MoeFfnForward(const QwenLayerWeights& layer,
                    const core::ModelConfig& config, std::span<const float> x,
                    std::span<float> router_logits,
                    std::span<float> gate_scratch, std::span<float> up_scratch,
@@ -275,9 +275,11 @@ void MoeFfnForwardRows(
   // the expert GEMV on device when this read shows up in a prefill profile.
   const std::size_t per_row = rows * kMaxSelectedExperts;
   std::vector<std::uint32_t> host_ids(per_row);
-  // Blocking copy: the host staging is pageable, so this also waits for the
-  // routing kernels queued above. The routed weights never leave the device.
-  if (hipMemcpy(host_ids.data(), expert_ids.data(),
+  // The arena stream is created with hipStreamNonBlocking, so a blocking copy
+  // on the default stream is not ordered against the routing kernels above and
+  // would read the previous layer's ids. Drain the stream first.
+  if (hipStreamSynchronize(stream) != hipSuccess ||
+      hipMemcpy(host_ids.data(), expert_ids.data(),
                 per_row * sizeof(std::uint32_t),
                 hipMemcpyDeviceToHost) != hipSuccess) {
     return;

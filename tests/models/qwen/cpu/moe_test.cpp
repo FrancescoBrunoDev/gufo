@@ -215,8 +215,7 @@ void TestMoeFfnMatchesReference() {
   std::vector<float> out(kHidden, 0.0F);
 
   gufo::models::qwen::MoeFfnForward(
-      gufo::models::qwen::CpuModuleContext{}, layer, config,
-      std::span<const float>(x_data), std::span<float>(logits),
+      layer, config, std::span<const float>(x_data), std::span<float>(logits),
       std::span<float>(ffn_gate), std::span<float>(ffn_up),
       std::span<float>(act), std::span<float>(expert_out),
       std::span<float>(out));

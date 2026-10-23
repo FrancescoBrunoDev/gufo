@@ -97,11 +97,10 @@ int main() {
   std::vector<float> host_expert_out(kHidden);
   std::vector<float> expected(kHidden, 0.0F);
   gufo::models::qwen::MoeFfnForward(
-      gufo::models::qwen::CpuModuleContext{}, host_layer, config,
-      std::span<const float>(x_data), std::span<float>(host_logits),
-      std::span<float>(host_gate), std::span<float>(host_up),
-      std::span<float>(host_act), std::span<float>(host_expert_out),
-      std::span<float>(expected));
+      host_layer, config, std::span<const float>(x_data),
+      std::span<float>(host_logits), std::span<float>(host_gate),
+      std::span<float>(host_up), std::span<float>(host_act),
+      std::span<float>(host_expert_out), std::span<float>(expected));
 
   // Same weights and inputs on device.
   DeviceBuffer<float> device_router(router_data);
