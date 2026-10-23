@@ -4,7 +4,6 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
-#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -287,8 +286,7 @@ void MoeFfnForwardRows(
     return;
   }
 
-  static const bool skip_shexp = std::getenv("GUFO_SKIP_SHEXP") != nullptr;
-  const bool has_shared_expert = !skip_shexp && !layer.ffn_gate_shexp.empty();
+  const bool has_shared_expert = !layer.ffn_gate_shexp.empty();
   for (std::size_t row = 0; row < rows; ++row) {
     const auto selected = std::span<const std::uint32_t>(
         host_ids.data() + (row * kMaxSelectedExperts), selected_per_row);

@@ -1,6 +1,5 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
-#include <cstdlib>
 #include <stdexcept>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
@@ -313,23 +312,18 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       // below only applies RoPE in place and never touches the cache, so it
       // still needs the pack.
       const bool kv_already_written = fused_qknorm_rope_kv;
-      static const bool skip_attention =
-          std::getenv("GUFO_SKIP_ATTN") != nullptr;
-      const bool wmma_attention =
-          !skip_attention &&
-          LaunchQwenWmmaAttention(
-              arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
-              arena_.d_kv_cache, OffsetIfPresent(arena_.d_kv_cache, total_k),
-              arena_.d_attention_kv_f16,
-              OffsetIfPresent(
-                  static_cast<std::uint16_t*>(arena_.d_attention_kv_f16),
-                  total_k),
-              arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
-              arena_.GetMaxContext(), config.num_attention_heads,
-              config.num_key_value_heads, config.head_dim, arena_.stream,
-              /*lse_out=*/nullptr, /*key_begin=*/0,
-              /*skip_kv_write=*/kv_already_written, attention_workspace.gate,
-              attention_workspace.up);
+      const bool wmma_attention = LaunchQwenWmmaAttention(
+          arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
+          arena_.d_kv_cache, OffsetIfPresent(arena_.d_kv_cache, total_k),
+          arena_.d_attention_kv_f16,
+          OffsetIfPresent(
+              static_cast<std::uint16_t*>(arena_.d_attention_kv_f16), total_k),
+          arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
+          arena_.GetMaxContext(), config.num_attention_heads,
+          config.num_key_value_heads, config.head_dim, arena_.stream,
+          /*lse_out=*/nullptr, /*key_begin=*/0,
+          /*skip_kv_write=*/kv_already_written, attention_workspace.gate,
+          attention_workspace.up);
       if (wmma_attention) {
         detail::EmitAttentionDispatch("prefill_wmma", "");
       }
@@ -339,9 +333,6 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         detail::DispatchPrefillAttention(
             visible_context,
             [&] {
-              if (skip_attention) {
-                return false;
-              }
               tiled_attention = LaunchBatchedAttentionTile(
                   arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
                   arena_.d_kv_cache,
@@ -356,9 +347,6 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
               return tiled_attention;
             },
             [&] {
-              if (skip_attention) {
-                return;
-              }
               LaunchBatchedAttention(
                   arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
                   arena_.d_kv_cache,
@@ -452,10 +440,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                                       config.SsmValueSize()),
           arena_.d_ssm_kq_scales != nullptr &&
               arena_.d_ssm_alpha_beta != nullptr);
-      static const bool skip_ssm = std::getenv("GUFO_SKIP_SSM") != nullptr;
-      if (skip_ssm) {
-        // Temporary ablation only.
-      } else if (ssm_row_split) {
+      if (ssm_row_split) {
         LaunchBatchedSSMConvRecurrenceRowSplit(
             arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
             recurrent_state, arena_.d_conv_out, arena_.d_alpha_buf,
@@ -525,10 +510,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                            static_cast<const float*>(layer.ffn_norm.data),
                            arena_.d_normed, nullptr, batch_size, hidden_size,
                            eps, arena_.stream);
-      static const bool skip_moe = std::getenv("GUFO_SKIP_MOE") != nullptr;
-      if (skip_moe) {
-        // Temporary ablation only.
-      } else if (batch_size > 1) {
+      if (batch_size > 1) {
         // Pack the tokens that chose the same expert and serve each projection
         // with one batched GEMM, instead of three single-row GEMVs per token
         // per expert.
