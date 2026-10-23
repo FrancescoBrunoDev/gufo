@@ -256,6 +256,17 @@ per row plus one sigmoid-scale kernel per row was 2048 launches per layer at
 pp2048 width; `LaunchMoeRouteRows` and `LaunchSigmoidScaledAddRows` make it one
 each, worth 28% of pp512 and 35% of pp2048 on its own.
 
+**Where the remaining time is.** Skipping the routed experts entirely measures
+pp512 1455 tok/s and pp2048 892 tok/s, so the experts are 49% of pp2048 and 75%
+of pp512; the rest is attention, the DeltaNet recurrence and the dense
+projections. Both halves are still four times less efficient per FLOP than the
+dense 27B layer, which is the next thing to measure rather than guess at: the
+expert kernel streams Q4_K at 43 GB/s where the hardware sustains about 240,
+and the non-expert path is already fully batched -- no per-row launches are left
+to remove. Closing either needs kernel work (a per-launch grid over all buckets
+so the 32-block launches stop paying a tail on every expert, and a wider
+streaming dequant), not scheduling changes.
+
 `kernel_resources_test` guards the new instantiations: the same sweep briefly
 moved the dense path's 128-token tile to 64 and that instantiation spilled 348
 bytes of scratch, which the check caught.
