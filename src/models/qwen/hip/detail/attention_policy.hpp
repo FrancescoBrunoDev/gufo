@@ -91,6 +91,21 @@ struct AttentionSupportParams {
          params.has_k_cache_f16 && params.has_v_cache_f16;
 }
 
+/// Shape rules for the tiled prefill kernel, which is instantiated per head
+/// layout: 256-wide heads, a whole number of query heads per KV head, and an
+/// even GQA group so a block can own a query head pair. The Flash-Next layout
+/// (24 query, 4 KV) and the Qwen3.5-MoE layout (32 query, 2 KV) both qualify.
+[[nodiscard]] constexpr bool IsTiledAttentionShapeSupported(
+    const AttentionSupportParams& params) noexcept {
+  return params.batch_size != 0 && params.head_dim == kTiledAttentionHeadDim &&
+         params.num_kv_heads != 0 &&
+         params.num_heads % params.num_kv_heads == 0 &&
+         ((params.num_heads / params.num_kv_heads) % 2) == 0 &&
+         static_cast<std::size_t>(params.start_pos) + params.batch_size <=
+             params.max_context &&
+         params.has_k_cache_f16 && params.has_v_cache_f16;
+}
+
 /// The row-split recurrence needs two scratch planes and a 128 x 128 state
 /// tile.
 [[nodiscard]] constexpr bool ShouldUseSsmRowSplitRecurrence(

@@ -224,7 +224,8 @@ same run repeated twice):
 | --- | --- | --- | --- | --- | --- |
 | pp128 | 44.1 | 131.3 | 135.9 | - | 157.4 | **217.3** |
 | pp512 | 44.4 | 160.9 | 170.5 | 195.5 | 206.6 | **369.1** | 530.9 |
-| pp2048 | 43.4 | 162.6 | 175.4 | 198.9 | 212.0 | **453.5** | - |
+| pp2048 | 43.4 | 162.6 | 175.4 | 198.9 | 212.0 | **582.7** | - |
+| pp4096 | - | - | - | - | - | **610.8** | - |
 | tg8 | 19.5 | 19.6 | 19.6 | 19.6 | 19.6 | 19.6 | - |
 
 The shared-expert step alone is worth 15% of prefill: skipping it entirely
@@ -263,16 +264,26 @@ measures pp512 362 and pp2048 608. So at pp512 the experts are 75% of the chunk
 and attention is 2%; at pp2048 the experts are 44% and attention is 25%, the
 rest being the DeltaNet recurrence and the dense projections.
 
+**The tiled attention kernel now covers this model's head layout.** The twelve
+full-attention layers were running `prefill_baseline` above a 1024-token
+context, because `IsTiledAttentionSupported` compared the head layout against
+the Flash-Next constants (24 query heads, 4 KV heads) while this model has 32
+and 2. The kernel only used those constants for head indexing, so the shape is
+now a template argument and both layouts are instantiated; the WMMA route keeps
+its own predicate, and the pack kernel keeps its plain name because the WMMA
+route declares it. All twelve layers report `prefill_tiled` in the dispatch
+telemetry, and a 1600-token prompt with forty greedy tokens produces a
+continuation byte-identical to the forced-baseline run. pp2048 455.4 -> 582.7
+and pp4096 610.8; pp512 is unchanged because the tiled path only applies above
+1024 tokens of visible context.
+
 That split explains the pp curve. It also says the expert path is no longer the
 place to look for a large win at short prompts: `moe_expert_gemm_bench` measures
 the three projections of a sixteen-token bucket at 65 GB/s per byte read (gate
-and up at 57, down at 69), against about 68 GB/s for llama.cpp. Two things are
-still on the table. At long context the twelve full-attention layers fall back
-to `prefill_baseline` because `IsTiledAttentionSupported` only accepts 24 query
-heads and 4 KV heads (the Flash-Next shape), while this model has 32 and 2; the
-dispatch telemetry says so directly. And every expert is still its own kernel
-launch, so a bucket of 32 blocks pays a tail on a 20-WGP part 256 times per
-layer -- a grid over all buckets of a layer would remove it.
+and up at 57, down at 69), against about 68 GB/s for llama.cpp. One thing is still on the
+table: every expert is its own kernel launch, so a bucket of 32 blocks pays a
+tail on a 20-WGP part 256 times per layer, and a grid over all buckets of a
+layer would remove it.
 
 `kernel_resources_test` guards the new instantiations: the same sweep briefly
 moved the dense path's 128-token tile to 64 and that instantiation spilled 348
