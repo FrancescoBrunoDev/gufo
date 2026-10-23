@@ -224,8 +224,8 @@ same run repeated twice):
 | --- | --- | --- | --- | --- | --- |
 | pp128 | 44.1 | 131.3 | 135.9 | - | 157.4 | **217.3** |
 | pp512 | 44.4 | 160.9 | 170.5 | 195.5 | 206.6 | **369.1** | 530.9 |
-| pp2048 | 43.4 | 162.6 | 175.4 | 198.9 | 212.0 | **582.7** | - |
-| pp4096 | - | - | - | - | - | **610.8** | - |
+| pp2048 | 43.4 | 162.6 | 175.4 | 198.9 | 212.0 | **584.5** | - |
+| pp4096 | - | - | - | - | - | **612.8** | - |
 | tg8 | 19.5 | 19.6 | 19.6 | 19.6 | 19.6 | 19.6 | - |
 
 The shared-expert step alone is worth 15% of prefill: skipping it entirely
@@ -274,8 +274,12 @@ its own predicate, and the pack kernel keeps its plain name because the WMMA
 route declares it. All twelve layers report `prefill_tiled` in the dispatch
 telemetry, and a 1600-token prompt with forty greedy tokens produces a
 continuation byte-identical to the forced-baseline run. pp2048 455.4 -> 582.7
-and pp4096 610.8; pp512 is unchanged because the tiled path only applies above
+and pp4096 612.8; pp512 is unchanged because the tiled path only applies above
 1024 tokens of visible context.
+
+Measure each width in its own run: the first prompt of a combined sweep reads
+about 3x low here (60.96 against 217.4 for pp128), and it repeats as a clean
+217.3-217.6 three times on its own.
 
 That split explains the pp curve. It also says the expert path is no longer the
 place to look for a large win at short prompts: `moe_expert_gemm_bench` measures
