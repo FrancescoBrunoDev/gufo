@@ -63,6 +63,7 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm_row_split.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/swiglu.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/moe.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/moe_pair.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_batched.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_decode.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_decode_verify_wave64.hip

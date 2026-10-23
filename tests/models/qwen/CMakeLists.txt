@@ -85,6 +85,10 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_moe_expert_gemm_bench
     tests/models/qwen/hip/moe_expert_gemm_bench.cpp
     "hip;gpu;qwen;moe;bench")
+  # The paired gate/up bucket kernel the bench compares against production
+  # lives with the bench: it is not wired into any model path.
+  target_sources(qwen_moe_expert_gemm_bench PRIVATE
+    ${PROJECT_SOURCE_DIR}/tests/models/qwen/hip/moe_pair_gemm.hip)
   add_qwen_hip_test(qwen_moe_real_weights_test
     tests/models/qwen/hip/moe_real_weights_test.cpp
     "hip;gpu;qwen;moe;model")

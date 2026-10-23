@@ -318,6 +318,23 @@ deterministic across the split and unsplit schedules
 its order now matches the per-row path's, which moved `rows=5` from 5.96e-08 to
 2.98e-08. Worth pp128 321 -> 340, pp2048 746 -> 779, pp4096 729 -> 747.
 
+**The gate and up projections are paired.** A bucket ran three launches -- gate,
+up, then a SwiGLU + Q8_1 pass over both FP32 results -- so the activation tile was
+read twice and 2*count*expert_ffn FP32 bytes were written and read back for
+values a GEMM had held in registers. `LaunchMoePairGateUpSwiGluQ8` keeps the same
+32-row weight tile and 64/128-token tile, computes both projections from one
+activation read, and writes SiLU(gate) * up straight into the tiled Q8_1 the down
+projection consumes. Measured in `moe_expert_gemm_bench pair` against the chain:
+1.32-1.35x at bucket widths 16-32, 1.30x at 64, 1.13x at 128, with
+`max|dq| = 0` over every slot of every tile, tails included. The 256-token tile
+was dropped to 128: its two live matrices need 64 accumulators and that
+instantiation spilled 72 VGPRs into a 164-byte private segment and measured no
+faster than two 128-token blocks. End to end the gain is smaller than the
+microbenchmark's 1.3x because four expert streams already saturate the memory
+system, so the scratch traffic the pair removes was partly free: pp512 546 -> 558,
+pp2048 779 -> 790, pp4096 747 -> 785. The numerical result is unchanged to the
+bit (`qwen_moe_real_weights_test` reports the same 0.156596 and 753.172).
+
 **The non-expert remainder is at the dense rate, not below it.** The old note
 here claimed it ran at a third of the dense FFN's per-FLOP rate; that was an
 arithmetic error from counting 50 M parameters per layer instead of the ~150 M

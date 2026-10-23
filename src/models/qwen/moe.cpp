@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "src/models/qwen/forward.hpp"  // TensorGEMV
+#include "src/models/qwen/hip/kernels/moe_pair.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -593,20 +594,31 @@ void MoeFfnForwardRowsBucketed(
       ::gufo::hip::LaunchBatchedGatherQuantizeQ8_1(
           x.data(), perm_rows.data() + begin, q8_x, count, hidden,
           expert_stream_h);
-      ::gufo::hip::LaunchMoeBucketQuantGEMM(
-          gate_w.type, gate_w.data, q8_x, gate_scratch_e.data(), count,
-          expert_ffn, hidden, expert_stream_h);
-      ::gufo::hip::LaunchMoeBucketQuantGEMM(
-          up_w.type, up_w.data, q8_x, up_scratch_e.data(), count, expert_ffn,
-          hidden, expert_stream_h);
-      // The two GEMMs above have consumed the activation, so the SwiGLU result
-      // takes the same buffer in its Q8_1 form for the down projection.
-      ::gufo::hip::LaunchBatchedFusedSwiGLUQuantizeQ8_1(
-          gate_scratch_e.data(), up_scratch_e.data(), q8_x, count, expert_ffn,
-          expert_stream_h);
-      ::gufo::hip::LaunchMoeBucketQuantGEMM(down_w.type, down_w.data, q8_x,
-                                            expert_out_e, count, hidden,
-                                            expert_ffn, expert_stream_h);
+      // Both projections read the bucket's activation once and the SwiGLU
+      // result goes straight to the tiled Q8_1 the down projection consumes, so
+      // neither FP32 intermediate is stored. It writes into the gathered slice
+      // because q8_x is still being read by the pair's own blocks.
+      void* q8_swiglu = gathered_e.data();
+      if (::gufo::hip::LaunchMoePairGateUpSwiGluQ8(
+              gate_w.type, gate_w.data, up_w.data, q8_x, q8_swiglu, nullptr,
+              count, expert_ffn, hidden, expert_stream_h)) {
+        ::gufo::hip::LaunchMoeBucketQuantGEMM(
+            down_w.type, down_w.data, q8_swiglu, expert_out_e, count, hidden,
+            expert_ffn, expert_stream_h);
+      } else {
+        ::gufo::hip::LaunchMoeBucketQuantGEMM(
+            gate_w.type, gate_w.data, q8_x, gate_scratch_e.data(), count,
+            expert_ffn, hidden, expert_stream_h);
+        ::gufo::hip::LaunchMoeBucketQuantGEMM(
+            up_w.type, up_w.data, q8_x, up_scratch_e.data(), count, expert_ffn,
+            hidden, expert_stream_h);
+        ::gufo::hip::LaunchBatchedFusedSwiGLUQuantizeQ8_1(
+            gate_scratch_e.data(), up_scratch_e.data(), q8_x, count, expert_ffn,
+            expert_stream_h);
+        ::gufo::hip::LaunchMoeBucketQuantGEMM(down_w.type, down_w.data, q8_x,
+                                              expert_out_e, count, hidden,
+                                              expert_ffn, expert_stream_h);
+      }
     } else {
       ::gufo::hip::LaunchMoeGatherRows(x.data(), perm_rows.data() + begin,
                                        gathered_e.data(), count, hidden,
