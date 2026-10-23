@@ -222,7 +222,7 @@ same run repeated twice):
 
 | test | per-token routing | bucketed | + 16-row sharing | + batched shared expert | llama.cpp (same GPU) |
 | --- | --- | --- | --- | --- | --- |
-| pp128 | 44.1 | 131.3 | 135.9 | - | - |
+| pp128 | 44.1 | 131.3 | 135.9 | **157.4** | - |
 | pp512 | 44.4 | 160.9 | 170.5 | **206.6** | 530.9 |
 | pp2048 | 43.4 | 162.6 | 175.4 | **212.0** | - |
 | tg8 | 19.5 | 19.6 | 19.6 | 19.6 | - |
@@ -231,8 +231,9 @@ The shared-expert step alone is worth 15% of prefill: skipping it entirely
 measured pp512 224.7 and pp2048 230.4, so about half of what it still costs is
 the per-row scalar gate and the Q8_1 quantize passes.
 
-Prefill is 4.4-4.6x faster than the per-token routing and now scales with the
-prompt length. Generation is untouched, as it must be.
+Prefill is 3.6-4.9x faster than the per-token routing and now scales with the
+prompt length, because a longer chunk gives every expert more rows per weight
+stream. Generation is untouched, as it must be.
 
 ### What is left in prompt processing
 
