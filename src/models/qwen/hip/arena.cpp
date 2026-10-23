@@ -709,6 +709,26 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       policy_(policy) {
   try {
     HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+    // A mixture-of-experts bucket GEMM is one launch of about 32 blocks, so a
+    // single main stream only ever keeps that many in flight and the weight
+    // stream stalls well under the memory ceiling. Four experts at a time fill
+    // the part; more than four adds nothing (measured in
+    // `qwen_moe_expert_gemm_bench`). Each side stream reads and writes its own
+    // scratch slice, so the split changes scheduling only.
+    if (config_.IsMoe()) {
+      moe_stream_ring.push_back(reinterpret_cast<void*>(stream));
+      for (std::size_t i = 1; i < kMoePrefillSlices; ++i) {
+        hipStream_t side = nullptr;
+        HIP_CHECK(hipStreamCreateWithFlags(&side, hipStreamNonBlocking));
+        moe_side_streams.push_back(reinterpret_cast<void*>(side));
+        moe_stream_ring.push_back(reinterpret_cast<void*>(side));
+      }
+      for (std::size_t i = 0; i < kMoePrefillSlices; ++i) {
+        hipEvent_t event = nullptr;
+        HIP_CHECK(hipEventCreateWithFlags(&event, hipEventDisableTiming));
+        moe_side_events.push_back(reinterpret_cast<void*>(event));
+      }
+    }
     HIPBLAS_CHECK(hipblasCreate(&hipblas_handle));
     HIPBLAS_CHECK(hipblasSetStream(hipblas_handle, stream));
     hipblaslt_gemm = std::make_unique<HipblasLtGemm>();
@@ -737,25 +757,37 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
     HIP_CHECK(hipMalloc(&d_k, batch * kv_size * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_v, batch * kv_size * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_attn_out, batch * hidden_size * sizeof(float)));
-    HIP_CHECK(
-        hipMalloc(&d_ffn_gate, batch * intermediate_size * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_ffn_up, batch * intermediate_size * sizeof(float)));
-    HIP_CHECK(hipMalloc(&d_ffn_act, batch * intermediate_size * sizeof(float)));
+    const std::size_t moe_slices =
+        config_.IsMoe() ? kMoePrefillSlices : std::size_t{1};
+    HIP_CHECK(hipMalloc(
+        &d_ffn_gate, moe_slices * batch * intermediate_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(
+        &d_ffn_up, moe_slices * batch * intermediate_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(
+        &d_ffn_act, moe_slices * batch * intermediate_size * sizeof(float)));
     HIP_CHECK(hipMalloc(&d_ffn_out, batch * hidden_size * sizeof(float)));
     // One allocation for the router logits, the selected weights and one
     // expert's output; the ids are uint32 so they get their own.
     // Per row: the router logits, the selected weights and the output; the
     // selected ids are uint32 so they get their own allocation.
+    // One output slot per packed expert row: the expert-parallel schedule runs
+    // several experts at a time and their results have to survive until the
+    // deferred scatter, which accumulates them in expert order.
+    const std::size_t moe_out_floats =
+        config_.IsMoe()
+            ? batch * models::qwen::kMaxSelectedExperts * hidden_size
+            : batch * hidden_size;
     const std::size_t moe_routed_floats =
-        batch * (config_.expert_count + models::qwen::kMaxSelectedExperts +
-                 hidden_size);
+        batch * (config_.expert_count + models::qwen::kMaxSelectedExperts) +
+        moe_out_floats;
     HIP_CHECK(hipMalloc(&d_moe_scratch, moe_routed_floats * sizeof(float)));
     HIP_CHECK(hipMalloc(
         &d_moe_expert_ids,
         batch * models::qwen::kMaxSelectedExperts * sizeof(std::uint32_t)));
     // Expert-bucketed prefill: one packed row buffer reused per expert, the
     // permutation that indexes it, and the CSR offsets over the experts.
-    HIP_CHECK(hipMalloc(&d_moe_gathered, batch * hidden_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_moe_gathered,
+                        moe_slices * batch * hidden_size * sizeof(float)));
     HIP_CHECK(hipMalloc(
         &d_moe_perm_rows,
         batch * models::qwen::kMaxSelectedExperts * sizeof(std::uint32_t)));
@@ -797,7 +829,7 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
     const std::size_t scratch_q8_bytes =
         ((((q8_rows * q8_row_elements) + 31) / 32) * sizeof(float) * 10) +
         4096;  // 36-byte payload + 4-byte sidecar per 32 elems
-    HIP_CHECK(hipMalloc(&d_scratch_q8_act, scratch_q8_bytes));
+    HIP_CHECK(hipMalloc(&d_scratch_q8_act, moe_slices * scratch_q8_bytes));
     const std::size_t split_k_elements = detail::DecodeAttentionScratchElements(
         config_.num_attention_heads, config_.head_dim);
     HIP_CHECK(
@@ -846,7 +878,12 @@ QwenGpuArena::~QwenGpuArena() {
 QwenGpuScratchView QwenGpuArena::GetScratchView(
     std::size_t batch_size) noexcept {
   const std::size_t batch = std::min<std::size_t>(batch_size, max_batch_);
+  const std::size_t moe_slices =
+      config_.IsMoe() ? kMoePrefillSlices : std::size_t{1};
   const std::size_t hidden = config_.hidden_size;
+  const std::size_t moe_out_floats =
+      config_.IsMoe() ? batch * models::qwen::kMaxSelectedExperts * hidden
+                      : batch * hidden;
   const std::size_t attention = config_.AttentionSize();
   const std::size_t kv =
       static_cast<std::size_t>(config_.num_key_value_heads) * config_.head_dim;
@@ -903,9 +940,11 @@ QwenGpuScratchView QwenGpuArena::GetScratchView(
           },
       .ffn =
           {
-              .gate = {d_ffn_gate, batch * config_.intermediate_size},
-              .up = {d_ffn_up, batch * config_.intermediate_size},
-              .activation = {d_ffn_act, batch * config_.intermediate_size},
+              .gate = {d_ffn_gate,
+                       moe_slices * batch * config_.intermediate_size},
+              .up = {d_ffn_up, moe_slices * batch * config_.intermediate_size},
+              .activation = {d_ffn_act,
+                             moe_slices * batch * config_.intermediate_size},
               .out = {d_ffn_out, batch * hidden},
               .router_logits = {d_moe_scratch, batch * config_.expert_count},
               .expert_ids = {d_moe_expert_ids,
@@ -915,8 +954,8 @@ QwenGpuScratchView QwenGpuArena::GetScratchView(
               .moe_out = {d_moe_scratch +
                               (batch * (config_.expert_count +
                                         models::qwen::kMaxSelectedExperts)),
-                          batch * hidden},
-              .moe_gathered = {d_moe_gathered, batch * hidden},
+                          moe_out_floats},
+              .moe_gathered = {d_moe_gathered, moe_slices * batch * hidden},
               .moe_perm_rows = {d_moe_perm_rows,
                                 batch * models::qwen::kMaxSelectedExperts},
               .moe_perm_slots = {d_moe_perm_slots,
@@ -926,10 +965,15 @@ QwenGpuScratchView QwenGpuArena::GetScratchView(
               .moe_gate = {d_moe_gate, batch},
               .hipblas = hipblas_handle,
               .q8_activation = {static_cast<std::byte*>(d_scratch_q8_act),
-                                QuantizedActivationBytes(
-                                    (((batch + 15) / 16) * 16),
-                                    std::max<std::size_t>(
-                                        config_.intermediate_size, hidden))},
+                                moe_slices * QuantizedActivationBytes(
+                                                 (((batch + 15) / 16) * 16),
+                                                 std::max<std::size_t>(
+                                                     config_.intermediate_size,
+                                                     hidden))},
+              .moe_slices = static_cast<std::uint32_t>(moe_slices),
+              .moe_streams = {moe_stream_ring.data(),
+                              static_cast<std::size_t>(moe_slices)},
+              .moe_events = {moe_side_events.data(), moe_side_events.size()},
           },
   };
 }
@@ -995,6 +1039,9 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_prompt_tokens = other.d_prompt_tokens;
   d_target_layer_features = other.d_target_layer_features;
   stream = other.stream;
+  moe_side_streams = std::move(other.moe_side_streams);
+  moe_side_events = std::move(other.moe_side_events);
+  moe_stream_ring = std::move(other.moe_stream_ring);
   hipblas_handle = other.hipblas_handle;
   hipblaslt_gemm = std::move(other.hipblaslt_gemm);
   d_scratch_bf16 = other.d_scratch_bf16;
@@ -1048,6 +1095,9 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.d_prompt_tokens = nullptr;
   other.d_target_layer_features = nullptr;
   other.stream = nullptr;
+  other.moe_side_streams.clear();
+  other.moe_side_events.clear();
+  other.moe_stream_ring.clear();
   other.hipblas_handle = nullptr;
   other.d_scratch_bf16 = nullptr;
   other.d_scratch_q8_act = nullptr;
@@ -1110,6 +1160,9 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     d_prompt_tokens = other.d_prompt_tokens;
     d_target_layer_features = other.d_target_layer_features;
     stream = other.stream;
+    moe_side_streams = std::move(other.moe_side_streams);
+    moe_side_events = std::move(other.moe_side_events);
+    moe_stream_ring = std::move(other.moe_stream_ring);
     hipblas_handle = other.hipblas_handle;
     hipblaslt_gemm = std::move(other.hipblaslt_gemm);
     d_scratch_bf16 = other.d_scratch_bf16;
@@ -1163,6 +1216,9 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     other.d_prompt_tokens = nullptr;
     other.d_target_layer_features = nullptr;
     other.stream = nullptr;
+    other.moe_side_streams.clear();
+    other.moe_side_events.clear();
+    other.moe_stream_ring.clear();
     other.hipblas_handle = nullptr;
     other.d_scratch_bf16 = nullptr;
     other.d_scratch_q8_act = nullptr;
@@ -1223,6 +1279,15 @@ void QwenGpuArena::Reset() {
 }
 
 void QwenGpuArena::FreeAll() noexcept {
+  for (void* event : moe_side_events) {
+    LogCleanupError(hipEventDestroy(static_cast<hipEvent_t>(event)));
+  }
+  moe_side_events.clear();
+  for (void* side : moe_side_streams) {
+    LogCleanupError(hipStreamDestroy(static_cast<hipStream_t>(side)));
+  }
+  moe_side_streams.clear();
+  moe_stream_ring.clear();
   if (d_hidden != nullptr)
     LogCleanupError(hipFree(d_hidden));
   if (d_normed != nullptr)

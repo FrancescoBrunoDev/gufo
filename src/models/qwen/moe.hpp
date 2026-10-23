@@ -81,7 +81,9 @@ void MoeFfnForwardRowsBucketed(
     std::span<float> gathered, std::span<std::uint32_t> perm_rows,
     std::span<std::uint32_t> perm_slots,
     std::span<std::uint32_t> expert_offsets, std::span<std::byte> q8_activation,
-    std::span<float> moe_gate, void* hipblas) noexcept;
+    std::span<float> moe_gate, void* hipblas,
+    std::span<void*> expert_streams = {},
+    std::span<void*> expert_events = {}) noexcept;
 
 }  // namespace gufo::models::qwen
 

@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -286,7 +287,8 @@ void MoeFfnForwardRows(
     return;
   }
 
-  const bool has_shared_expert = !layer.ffn_gate_shexp.empty();
+  static const bool skip_shexp = std::getenv("GUFO_SKIP_SHEXP") != nullptr;
+  const bool has_shared_expert = !skip_shexp && !layer.ffn_gate_shexp.empty();
   for (std::size_t row = 0; row < rows; ++row) {
     const auto selected = std::span<const std::uint32_t>(
         host_ids.data() + (row * kMaxSelectedExperts), selected_per_row);
@@ -313,7 +315,8 @@ void MoeFfnForwardRowsBucketed(
     std::span<float> gathered, std::span<std::uint32_t> perm_rows,
     std::span<std::uint32_t> perm_slots,
     std::span<std::uint32_t> expert_offsets, std::span<std::byte> q8_activation,
-    std::span<float> moe_gate, void* hipblas) noexcept {
+    std::span<float> moe_gate, void* hipblas, std::span<void*> expert_streams,
+    std::span<void*> expert_events) noexcept {
   const std::size_t hidden = config.hidden_size;
   const std::size_t experts = config.expert_count;
   const std::size_t selected_per_row = config.expert_used_count;
@@ -329,6 +332,26 @@ void MoeFfnForwardRowsBucketed(
     return;
   }
   const auto stream = static_cast<hipStream_t>(ctx.Stream());
+  // Expert-parallel prefill: expert `e` runs on ring[e % slices] against
+  // scratch slice e % slices. Every slice belongs to exactly one stream, and
+  // consecutive experts that share a stream also share a slice, so they
+  // serialize and never overlap. The ring is empty when the caller has no side
+  // streams, which leaves the whole call on the main stream.
+  const bool expert_parallel = expert_streams.size() > 1 &&
+                               expert_events.size() == expert_streams.size();
+  const std::size_t slices = expert_parallel ? expert_streams.size() : 1;
+  const auto slice = [slices](auto span, std::size_t index) {
+    const std::size_t per = span.size() / slices;
+    return span.subspan(index * per, per);
+  };
+  const auto expert_stream = [&](std::size_t expert) {
+    return slices > 1
+               ? static_cast<hipStream_t>(expert_streams[expert % slices])
+               : stream;
+  };
+  const auto expert_event = [&](std::size_t index) {
+    return static_cast<hipEvent_t>(expert_events[index]);
+  };
 
   // The router is a [experts, hidden] fp32 matrix: read once per chunk by one
   // fp32 GEMM instead of once per row by a GEMV, which at prefill width is the
@@ -412,91 +435,11 @@ void MoeFfnForwardRowsBucketed(
     return;
   }
 
-  // Per expert: pack its tokens, then run each projection as one batched GEMM.
-  // The routed weight stays on device for the accumulation.
-  for (std::size_t expert = 0; expert < experts; ++expert) {
-    const std::uint32_t begin = offsets[expert];
-    const std::uint32_t count = counts[expert];
-    if (count == 0) {
-      continue;
-    }
-    const auto gate_w =
-        ExpertSlice(layer.ffn_gate_exps, expert, expert_ffn * hidden);
-    const auto up_w =
-        ExpertSlice(layer.ffn_up_exps, expert, expert_ffn * hidden);
-    const auto down_w =
-        ExpertSlice(layer.ffn_down_exps, expert, hidden * expert_ffn);
-    if (gate_w.empty() || up_w.empty() || down_w.empty()) {
-      continue;
-    }
-    if (count < kBucketedRowsThreshold) {
-      // A one- or two-token bucket is common on short prompts and the batched
-      // GEMM gains nothing there, so those rows keep the decode GEMV chain.
-      for (std::uint32_t i = 0; i < count; ++i) {
-        const std::uint32_t source_row = packed_rows[begin + i];
-        const float* row_in =
-            x.data() + (static_cast<std::size_t>(source_row) * hidden);
-        float* row_act =
-            act_scratch.data() + (static_cast<std::size_t>(i) * expert_ffn);
-        float* row_out =
-            expert_out.data() + (static_cast<std::size_t>(i) * hidden);
-        float* row_gate =
-            gate_scratch.data() + (static_cast<std::size_t>(i) * expert_ffn);
-        float* row_up =
-            up_scratch.data() + (static_cast<std::size_t>(i) * expert_ffn);
-        ::gufo::hip::LaunchGEMV(gate_w.data, gate_w.type, row_in, row_gate,
-                                expert_ffn, hidden, stream);
-        ::gufo::hip::LaunchGEMV(up_w.data, up_w.type, row_in, row_up,
-                                expert_ffn, hidden, stream);
-        ::gufo::hip::LaunchBatchedSwiGLUActivation(row_gate, row_up, row_act,
-                                                   nullptr, expert_ffn, stream);
-        ::gufo::hip::LaunchGEMV(down_w.data, down_w.type, row_act, row_out,
-                                hidden, expert_ffn, stream);
-      }
-    } else if (count >= kMatrixCoreRowsThreshold &&
-               q8_activation.size() >=
-                   ::gufo::hip::QuantizedActivationBytes(count, hidden)) {
-      ::gufo::hip::LaunchMoeGatherRows(x.data(), perm_rows.data() + begin,
-                                       gathered.data(), count, hidden, stream);
-      void* q8_x = q8_activation.data();
-      ::gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(gathered.data(), q8_x,
-                                                        count, hidden, stream);
-      ::gufo::hip::LaunchMoeBucketQuantGEMM(gate_w.type, gate_w.data, q8_x,
-                                            gate_scratch.data(), count,
-                                            expert_ffn, hidden, stream);
-      ::gufo::hip::LaunchMoeBucketQuantGEMM(up_w.type, up_w.data, q8_x,
-                                            up_scratch.data(), count,
-                                            expert_ffn, hidden, stream);
-      // The two GEMMs above have consumed the activation, so the SwiGLU result
-      // takes the same buffer in its Q8_1 form for the down projection.
-      ::gufo::hip::LaunchBatchedFusedSwiGLUQuantizeQ8_1(
-          gate_scratch.data(), up_scratch.data(), q8_x, count, expert_ffn,
-          stream);
-      ::gufo::hip::LaunchMoeBucketQuantGEMM(down_w.type, down_w.data, q8_x,
-                                            expert_out.data(), count, hidden,
-                                            expert_ffn, stream);
-    } else {
-      ::gufo::hip::LaunchMoeGatherRows(x.data(), perm_rows.data() + begin,
-                                       gathered.data(), count, hidden, stream);
-      ::gufo::hip::LaunchBatchedQuantGEMMFp32(
-          gate_w.type, gate_w.data, gathered.data(), gate_scratch.data(), count,
-          expert_ffn, hidden, stream);
-      ::gufo::hip::LaunchBatchedQuantGEMMFp32(
-          up_w.type, up_w.data, gathered.data(), up_scratch.data(), count,
-          expert_ffn, hidden, stream);
-      ::gufo::hip::LaunchBatchedSwiGLUActivation(
-          gate_scratch.data(), up_scratch.data(), act_scratch.data(), nullptr,
-          count * expert_ffn, stream);
-      ::gufo::hip::LaunchBatchedQuantGEMMFp32(
-          down_w.type, down_w.data, act_scratch.data(), expert_out.data(),
-          count, hidden, expert_ffn, stream);
-    }
-    ::gufo::hip::LaunchMoeScatterAccumulate(
-        expert_out.data(), perm_rows.data() + begin, perm_slots.data() + begin,
-        expert_weights.data(), out.data(), count, hidden,
-        static_cast<std::uint32_t>(kMaxSelectedExperts), stream);
-  }
-
+  // The shared expert runs first, before any expert touches the slices: it uses
+  // slice zero and `gathered` as its output, so it has nothing to wait for and
+  // nothing of the expert pass to disturb. Its contribution lands in `out`
+  // before the routed experts accumulate on top, which keeps the result
+  // independent of how the expert work was scheduled.
   if (!layer.ffn_gate_shexp.empty()) {
     // The shared expert is a dense FFN over every row. From sixteen rows up its
     // projections use the tiled Q8_1 prefill GEMMs the dense FFN uses, so each
@@ -527,7 +470,7 @@ void MoeFfnForwardRowsBucketed(
           stream);
       ::gufo::hip::LaunchBatchedQuantGEMMPreQuantized(
           layer.ffn_down_shexp.type, layer.ffn_down_shexp.data, q8_x,
-          expert_out.data(), rows, hidden, shared_ffn, stream);
+          gathered.data(), rows, hidden, shared_ffn, stream);
     } else {
       ::gufo::hip::LaunchBatchedQuantGEMMFp32(
           layer.ffn_gate_shexp.type, layer.ffn_gate_shexp.data, x.data(),
@@ -540,7 +483,7 @@ void MoeFfnForwardRowsBucketed(
           rows * shared_ffn, stream);
       ::gufo::hip::LaunchBatchedQuantGEMMFp32(
           layer.ffn_down_shexp.type, layer.ffn_down_shexp.data,
-          act_scratch.data(), expert_out.data(), rows, hidden, shared_ffn,
+          act_scratch.data(), gathered.data(), rows, hidden, shared_ffn,
           stream);
     }
     // The gate is one fp32 vector per row: wide chunks read it once with a
@@ -554,7 +497,7 @@ void MoeFfnForwardRowsBucketed(
           static_cast<hipblasHandle_t>(hipblas), layer.ffn_gate_inp_shexp.data,
           false, x.data(), moe_gate.data(), rows, 1, hidden, nullptr, stream);
       ::gufo::hip::LaunchSigmoidScaledAddRows(
-          moe_gate.data(), expert_out.data(), out.data(),
+          moe_gate.data(), gathered.data(), out.data(),
           static_cast<std::uint32_t>(rows), hidden, stream);
     } else {
       for (std::size_t row = 0; row < rows; ++row) {
@@ -563,10 +506,147 @@ void MoeFfnForwardRowsBucketed(
             layer.ffn_gate_inp_shexp.data, layer.ffn_gate_inp_shexp.type,
             x.data() + (row * hidden), gate_logit.data(), 1, hidden, stream);
         ::gufo::hip::LaunchSigmoidScaledAdd(
-            gate_logit.data(), expert_out.data() + (row * hidden),
+            gate_logit.data(), gathered.data() + (row * hidden),
             out.data() + (row * hidden), hidden, stream);
       }
     }
+  }
+
+  // Everything above ran on the main stream, so fence the side streams behind
+  // it before they read the permutation, the offsets and the zeroed output.
+  // Event 0 is this fence; events 1.. are the per-stream completion fence.
+  if (expert_parallel) {
+    if (hipEventRecord(expert_event(0), stream) != hipSuccess) {
+      return;
+    }
+    for (std::size_t i = 1; i < slices; ++i) {
+      if (hipStreamWaitEvent(static_cast<hipStream_t>(expert_streams[i]),
+                             expert_event(0)) != hipSuccess) {
+        return;
+      }
+    }
+  }
+
+  // Per expert: pack its tokens, then run each projection as one batched GEMM.
+  // The routed weight stays on device for the accumulation.
+  for (std::size_t expert = 0; expert < experts; ++expert) {
+    const std::uint32_t begin = offsets[expert];
+    const std::uint32_t count = counts[expert];
+    if (count == 0) {
+      continue;
+    }
+    const auto gate_w =
+        ExpertSlice(layer.ffn_gate_exps, expert, expert_ffn * hidden);
+    const auto up_w =
+        ExpertSlice(layer.ffn_up_exps, expert, expert_ffn * hidden);
+    const auto down_w =
+        ExpertSlice(layer.ffn_down_exps, expert, hidden * expert_ffn);
+    if (gate_w.empty() || up_w.empty() || down_w.empty()) {
+      continue;
+    }
+    // This expert's private slice and stream. Two experts that map to the same
+    // slice also map to the same stream, so they never run at the same time.
+    const std::size_t part = expert % slices;
+    const hipStream_t expert_stream_h = expert_stream(expert);
+    const std::span<float> gate_scratch_e = slice(gate_scratch, part);
+    const std::span<float> up_scratch_e = slice(up_scratch, part);
+    const std::span<float> act_scratch_e = slice(act_scratch, part);
+    // This expert's own output slot in the packed layout, so a later expert on
+    // the same stream cannot overwrite it before the deferred scatter.
+    float* expert_out_e =
+        expert_out.data() + (static_cast<std::size_t>(begin) * hidden);
+    const std::span<float> gathered_e = slice(gathered, part);
+    const std::span<std::byte> q8_activation_e = slice(q8_activation, part);
+
+    if (count < kBucketedRowsThreshold) {
+      // A one- or two-token bucket is common on short prompts and the batched
+      // GEMM gains nothing there, so those rows keep the decode GEMV chain.
+      for (std::uint32_t i = 0; i < count; ++i) {
+        const std::uint32_t source_row = packed_rows[begin + i];
+        const float* row_in =
+            x.data() + (static_cast<std::size_t>(source_row) * hidden);
+        float* row_act =
+            act_scratch_e.data() + (static_cast<std::size_t>(i) * expert_ffn);
+        float* row_out = expert_out_e + (static_cast<std::size_t>(i) * hidden);
+        float* row_gate =
+            gate_scratch_e.data() + (static_cast<std::size_t>(i) * expert_ffn);
+        float* row_up =
+            up_scratch_e.data() + (static_cast<std::size_t>(i) * expert_ffn);
+        ::gufo::hip::LaunchGEMV(gate_w.data, gate_w.type, row_in, row_gate,
+                                expert_ffn, hidden, expert_stream_h);
+        ::gufo::hip::LaunchGEMV(up_w.data, up_w.type, row_in, row_up,
+                                expert_ffn, hidden, expert_stream_h);
+        ::gufo::hip::LaunchBatchedSwiGLUActivation(
+            row_gate, row_up, row_act, nullptr, expert_ffn, expert_stream_h);
+        ::gufo::hip::LaunchGEMV(down_w.data, down_w.type, row_act, row_out,
+                                hidden, expert_ffn, expert_stream_h);
+      }
+    } else if (count >= kMatrixCoreRowsThreshold &&
+               q8_activation_e.size() >=
+                   ::gufo::hip::QuantizedActivationBytes(count, hidden)) {
+      ::gufo::hip::LaunchMoeGatherRows(x.data(), perm_rows.data() + begin,
+                                       gathered_e.data(), count, hidden,
+                                       expert_stream_h);
+      void* q8_x = q8_activation_e.data();
+      ::gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(
+          gathered_e.data(), q8_x, count, hidden, expert_stream_h);
+      ::gufo::hip::LaunchMoeBucketQuantGEMM(
+          gate_w.type, gate_w.data, q8_x, gate_scratch_e.data(), count,
+          expert_ffn, hidden, expert_stream_h);
+      ::gufo::hip::LaunchMoeBucketQuantGEMM(
+          up_w.type, up_w.data, q8_x, up_scratch_e.data(), count, expert_ffn,
+          hidden, expert_stream_h);
+      // The two GEMMs above have consumed the activation, so the SwiGLU result
+      // takes the same buffer in its Q8_1 form for the down projection.
+      ::gufo::hip::LaunchBatchedFusedSwiGLUQuantizeQ8_1(
+          gate_scratch_e.data(), up_scratch_e.data(), q8_x, count, expert_ffn,
+          expert_stream_h);
+      ::gufo::hip::LaunchMoeBucketQuantGEMM(down_w.type, down_w.data, q8_x,
+                                            expert_out_e, count, hidden,
+                                            expert_ffn, expert_stream_h);
+    } else {
+      ::gufo::hip::LaunchMoeGatherRows(x.data(), perm_rows.data() + begin,
+                                       gathered_e.data(), count, hidden,
+                                       expert_stream_h);
+      ::gufo::hip::LaunchBatchedQuantGEMMFp32(
+          gate_w.type, gate_w.data, gathered_e.data(), gate_scratch_e.data(),
+          count, expert_ffn, hidden, expert_stream_h);
+      ::gufo::hip::LaunchBatchedQuantGEMMFp32(
+          up_w.type, up_w.data, gathered_e.data(), up_scratch_e.data(), count,
+          expert_ffn, hidden, expert_stream_h);
+      ::gufo::hip::LaunchBatchedSwiGLUActivation(
+          gate_scratch_e.data(), up_scratch_e.data(), act_scratch_e.data(),
+          nullptr, count * expert_ffn, expert_stream_h);
+      ::gufo::hip::LaunchBatchedQuantGEMMFp32(
+          down_w.type, down_w.data, act_scratch_e.data(), expert_out_e, count,
+          hidden, expert_ffn, expert_stream_h);
+    }
+  }
+
+  // Wait for every expert, then accumulate in expert order on the main stream.
+  // The sliced buffers are private to a stream, so nothing is read while it can
+  // still be written, and the accumulation order matches the unsplit path.
+  if (expert_parallel) {
+    for (std::size_t i = 1; i < slices; ++i) {
+      if (hipEventRecord(expert_event(i),
+                         static_cast<hipStream_t>(expert_streams[i])) !=
+              hipSuccess ||
+          hipStreamWaitEvent(stream, expert_event(i)) != hipSuccess) {
+        return;
+      }
+    }
+  }
+  for (std::size_t expert = 0; expert < experts; ++expert) {
+    const std::uint32_t begin = offsets[expert];
+    const std::uint32_t count = counts[expert];
+    if (count == 0) {
+      continue;
+    }
+    ::gufo::hip::LaunchMoeScatterAccumulate(
+        expert_out.data() + (static_cast<std::size_t>(begin) * hidden),
+        perm_rows.data() + begin, perm_slots.data() + begin,
+        expert_weights.data(), out.data(), count, hidden,
+        static_cast<std::uint32_t>(kMaxSelectedExperts), stream);
   }
 }
 

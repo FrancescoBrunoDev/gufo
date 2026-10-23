@@ -175,6 +175,48 @@ int main() {
         HIP_CHECK(hipStreamSynchronize(stream));
         const float moe_us = ElapsedUs(start, stop) / kIterations;
 
+        // The production pattern is one launch per expert, a few hundred per
+        // layer, so a launch only ever has that bucket's blocks in flight. This
+        // measures whether that concurrency ceiling is what holds the weight
+        // stream: the same 256 launches over 1..8 streams, disjoint outputs.
+        constexpr int kBucketCount = 256;
+        float* dev_y_ms = nullptr;
+        HIP_CHECK(hipMalloc(&dev_y_ms, 8 * y_elems * sizeof(float)));
+        hipStream_t side[7] = {};
+        for (auto& s : side) {
+          HIP_CHECK(hipStreamCreateWithFlags(&s, hipStreamNonBlocking));
+        }
+        std::printf("%6zu buckets256 GB/s:", batch);
+        for (int streams = 1; streams <= 8; streams *= 2) {
+          const int per = kBucketCount / streams;
+          const auto run = [&] {
+            for (int s = 0; s < streams; ++s) {
+              hipStream_t st = (s == 0) ? stream : side[s - 1];
+              float* y = dev_y_ms + (static_cast<std::size_t>(s) * y_elems);
+              for (int i = 0; i < per; ++i) {
+                gufo::hip::LaunchMoeBucketQuantGEMM(bench_case.type, dev_weight,
+                                                    dev_q8, y, batch,
+                                                    kExpertsWidth, kHidden, st);
+              }
+            }
+          };
+          run();
+          HIP_CHECK(hipDeviceSynchronize());
+          const auto t0 = std::chrono::steady_clock::now();
+          run();
+          HIP_CHECK(hipDeviceSynchronize());
+          const double us = std::chrono::duration<double, std::micro>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count();
+          const double gb = kBucketCount * weight_gb;
+          std::printf(" %dx=%.1f", streams, gb / (us * 1e-6));
+        }
+        std::printf("\n");
+        for (auto& s : side) {
+          HIP_CHECK(hipStreamDestroy(s));
+        }
+        HIP_CHECK(hipFree(dev_y_ms));
+
         std::vector<float> host_y(y_elems);
         std::vector<float> host_ref(y_elems);
         HIP_CHECK(hipMemcpy(host_y.data(), dev_y, y_elems * sizeof(float),

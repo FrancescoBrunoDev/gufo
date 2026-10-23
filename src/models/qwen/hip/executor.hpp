@@ -241,6 +241,18 @@ struct QwenFfnScratch {
   /// Tiled Q8_1 activation scratch, reused by the shared expert's prefill
   /// GEMMs.
   std::span<std::byte> q8_activation;
+  /// Expert-parallel prefill slices. Expert `e` runs its whole chain on
+  /// `moe_streams[e % moe_slices]` against slice `e % moe_slices` of the
+  /// scratch above, which is what gives the expert GEMM more than one bucket's
+  /// blocks of concurrency. Each stream owns its slice, so no two experts that
+  /// run at the same time share a buffer, and the scatter stays sequential on
+  /// the main stream in expert order so the accumulation order is unchanged.
+  /// One slice means everything stays on the main stream.
+  std::uint32_t moe_slices{1};
+  std::span<void*> moe_streams;
+  /// Event 0 fences the side streams behind the main stream; events 1.. fence
+  /// each side stream back against the main stream.
+  std::span<void*> moe_events;
 };
 
 /// Typed non-owning capability views over stable Qwen GPU arena allocations.
@@ -351,6 +363,12 @@ public:
   float* d_target_layer_features{nullptr};
 
   hipStream_t stream{nullptr};
+  // Side streams for the expert-parallel prefill; empty for a dense FFN.
+  // `moe_stream_ring` is the main stream followed by the side streams, which is
+  // what the scratch view hands to the expert loop.
+  std::vector<void*> moe_side_streams;
+  std::vector<void*> moe_stream_ring;
+  std::vector<void*> moe_side_events;
   hipblasHandle_t hipblas_handle{nullptr};
   std::unique_ptr<HipblasLtGemm> hipblaslt_gemm;
   void* d_scratch_bf16{nullptr};

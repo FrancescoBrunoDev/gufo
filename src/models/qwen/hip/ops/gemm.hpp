@@ -16,6 +16,12 @@
 
 namespace gufo::hip {
 
+/// Expert work at prefill width is spread over this many streams. One bucket
+/// launch is about 32 blocks, so a single stream leaves most of the part idle
+/// and the expert weight stream stalls at 43 GB/s; four reaches 83 GB/s on
+/// Q4_K and eight adds nothing (`qwen_moe_expert_gemm_bench`).
+inline constexpr std::size_t kMoePrefillSlices = 4;
+
 struct HipblasLtDispatchInfo {
   int algorithm_id{-1};
   std::string solution_name;

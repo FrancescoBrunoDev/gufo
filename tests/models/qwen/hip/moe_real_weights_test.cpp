@@ -237,13 +237,18 @@ int main(int argc, char** argv) {
     gufo::test::DeviceBuffer<float> dlogits(kRows * experts);
     gufo::test::DeviceBuffer<std::uint32_t> dids(kRows * kMaxSelectedExperts);
     gufo::test::DeviceBuffer<float> dweights(kRows * kMaxSelectedExperts);
-    gufo::test::DeviceBuffer<float> dgate(kRows * expert_ffn);
-    gufo::test::DeviceBuffer<float> dup(kRows * expert_ffn);
-    gufo::test::DeviceBuffer<float> dact(kRows * expert_ffn);
-    gufo::test::DeviceBuffer<float> dexpert_out(kRows * hidden);
+    // Sized for the expert-parallel path, which gives each of its streams a
+    // private slice of every per-expert buffer.
+    constexpr std::size_t kSlices = gufo::hip::kMoePrefillSlices;
+    gufo::test::DeviceBuffer<float> dgate(kSlices * kRows * expert_ffn);
+    gufo::test::DeviceBuffer<float> dup(kSlices * kRows * expert_ffn);
+    gufo::test::DeviceBuffer<float> dact(kSlices * kRows * expert_ffn);
+    // One slot per packed expert row, as the arena allocates it.
+    gufo::test::DeviceBuffer<float> dexpert_out(kRows * kMaxSelectedExperts *
+                                                hidden);
     gufo::test::DeviceBuffer<float> dout_rows(kRows * hidden);
     gufo::test::DeviceBuffer<float> dout_bucket(kRows * hidden);
-    gufo::test::DeviceBuffer<float> dgathered(kRows * hidden);
+    gufo::test::DeviceBuffer<float> dgathered(kSlices * kRows * hidden);
     gufo::test::DeviceBuffer<std::uint32_t> dperm_rows(kRows *
                                                        kMaxSelectedExperts);
     gufo::test::DeviceBuffer<std::uint32_t> dperm_slots(kRows *
@@ -256,27 +261,82 @@ int main(int argc, char** argv) {
             : expert_ffn;
     const std::size_t q8_bytes = gufo::hip::QuantizedActivationBytes(
         std::max<std::size_t>(kRows, 16), std::max(hidden, shared_ffn));
-    gufo::test::DeviceBuffer<std::byte> dq8(q8_bytes);
+    gufo::test::DeviceBuffer<std::byte> dq8(kSlices * q8_bytes);
 
-    gufo::models::qwen::MoeFfnForwardRowsBucketed(
-        gufo::models::qwen::HipModuleContext{}, device_layer, config, kRows,
-        std::span<const float>(dx.data(), kRows * hidden),
-        std::span<float>(dlogits.data(), kRows * experts),
-        std::span<std::uint32_t>(dids.data(), kRows * kMaxSelectedExperts),
-        std::span<float>(dweights.data(), kRows * kMaxSelectedExperts),
-        std::span<float>(dgate.data(), kRows * expert_ffn),
-        std::span<float>(dup.data(), kRows * expert_ffn),
-        std::span<float>(dact.data(), kRows * expert_ffn),
-        std::span<float>(dexpert_out.data(), kRows * hidden),
-        std::span<float>(dout_bucket.data(), kRows * hidden),
-        std::span<float>(dgathered.data(), kRows * hidden),
-        std::span<std::uint32_t>(dperm_rows.data(),
-                                 kRows * kMaxSelectedExperts),
-        std::span<std::uint32_t>(dperm_slots.data(),
-                                 kRows * kMaxSelectedExperts),
-        std::span<std::uint32_t>(doffsets.data(), experts + 1),
-        std::span<std::byte>(dq8.data(), dq8.size()),
-        std::span<float>(dgate_logits.data(), kRows), nullptr);
+    // Two schedules, same arithmetic: everything on the main stream, then the
+    // expert-parallel one the arena uses (expert e on stream e % slices against
+    // slice e % slices, scatters still sequential). Both must land on the
+    // per-row reference.
+    // Production uses a non-blocking stream for the main work; the legacy null
+    // stream has implicit-synchronization rules that the side streams do not
+    // take part in, so mirror production here.
+    hipStream_t main_stream = nullptr;
+    HIP_CHECK(hipStreamCreateWithFlags(&main_stream, hipStreamNonBlocking));
+    std::vector<hipStream_t> ring{main_stream};
+    for (std::size_t i = 1; i < kSlices; ++i) {
+      hipStream_t side = nullptr;
+      HIP_CHECK(hipStreamCreateWithFlags(&side, hipStreamNonBlocking));
+      ring.push_back(side);
+    }
+    std::vector<void*> ring_void;
+    for (hipStream_t side : ring) {
+      ring_void.push_back(reinterpret_cast<void*>(side));
+    }
+    std::vector<void*> events;
+    for (std::size_t i = 0; i < kSlices; ++i) {
+      hipEvent_t event = nullptr;
+      HIP_CHECK(hipEventCreateWithFlags(&event, hipEventDisableTiming));
+      events.push_back(reinterpret_cast<void*>(event));
+    }
+    std::vector<float> bucket_unsplit;
+    for (const bool split : {false, true}) {
+      gufo::models::qwen::MoeFfnForwardRowsBucketed(
+          gufo::models::qwen::HipModuleContext{main_stream}, device_layer,
+          config, kRows, std::span<const float>(dx.data(), kRows * hidden),
+          std::span<float>(dlogits.data(), kRows * experts),
+          std::span<std::uint32_t>(dids.data(), kRows * kMaxSelectedExperts),
+          std::span<float>(dweights.data(), kRows * kMaxSelectedExperts),
+          std::span<float>(dgate.data(), dgate.size()),
+          std::span<float>(dup.data(), dup.size()),
+          std::span<float>(dact.data(), dact.size()),
+          std::span<float>(dexpert_out.data(), dexpert_out.size()),
+          std::span<float>(dout_bucket.data(), kRows * hidden),
+          std::span<float>(dgathered.data(), dgathered.size()),
+          std::span<std::uint32_t>(dperm_rows.data(),
+                                   kRows * kMaxSelectedExperts),
+          std::span<std::uint32_t>(dperm_slots.data(),
+                                   kRows * kMaxSelectedExperts),
+          std::span<std::uint32_t>(doffsets.data(), experts + 1),
+          std::span<std::byte>(dq8.data(), dq8.size()),
+          std::span<float>(dgate_logits.data(), kRows), nullptr,
+          split ? std::span<void*>(ring_void) : std::span<void*>{},
+          split ? std::span<void*>(events) : std::span<void*>{});
+      HIP_CHECK(hipStreamSynchronize(main_stream));
+      HIP_CHECK(hipDeviceSynchronize());
+      if (split) {
+        const auto split_host = dout_bucket.CopyToHost();
+        float schedule_max = 0.0F;
+        for (std::size_t i = 0; i < split_host.size(); ++i) {
+          schedule_max = std::max(schedule_max,
+                                  std::fabs(split_host[i] - bucket_unsplit[i]));
+        }
+        std::cout << "expert-parallel schedule: rows=" << kRows
+                  << " max|diff|=" << schedule_max << "\n";
+        if (schedule_max > 1e-6F) {
+          std::cout << "expert-parallel schedule changed the result\n";
+          return 1;
+        }
+      } else {
+        bucket_unsplit = dout_bucket.CopyToHost();
+      }
+    }
+    for (void* event : events) {
+      HIP_CHECK(hipEventDestroy(static_cast<hipEvent_t>(event)));
+    }
+    for (std::size_t i = 1; i < ring.size(); ++i) {
+      HIP_CHECK(hipStreamDestroy(ring[i]));
+    }
+    HIP_CHECK(hipStreamDestroy(main_stream));
     gufo::models::qwen::MoeFfnForwardRows(
         gufo::models::qwen::HipModuleContext{}, device_layer, config, kRows,
         std::span<const float>(dx.data(), kRows * hidden),
